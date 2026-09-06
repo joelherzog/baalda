@@ -80,12 +80,20 @@ const insertLink: Command = (view) => {
   return true;
 };
 
+// The commands themselves, so the formatting toolbar can fire exactly what the
+// keys fire. One definition, two triggers — they cannot drift apart.
+export const toggleBold = toggleInline("**");
+export const toggleItalic = toggleInline("*");
+export const toggleInlineCode = toggleInline("`");
+export const toggleStrike = toggleInline("~~");
+export { insertLink };
+
 export function formattingKeymap() {
   return keymap.of([
-    { key: "Mod-b", run: toggleInline("**"), preventDefault: true },
-    { key: "Mod-i", run: toggleInline("*"), preventDefault: true },
-    { key: "Mod-e", run: toggleInline("`"), preventDefault: true },
-    { key: "Mod-Shift-x", run: toggleInline("~~"), preventDefault: true },
+    { key: "Mod-b", run: toggleBold, preventDefault: true },
+    { key: "Mod-i", run: toggleItalic, preventDefault: true },
+    { key: "Mod-e", run: toggleInlineCode, preventDefault: true },
+    { key: "Mod-Shift-x", run: toggleStrike, preventDefault: true },
     { key: "Mod-k", run: insertLink, preventDefault: true },
   ]);
 }

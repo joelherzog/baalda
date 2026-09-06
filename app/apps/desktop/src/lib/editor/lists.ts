@@ -19,10 +19,14 @@ const INDENT = "  ";
 // Leading indent, a marker, then the item body. `marker` is a bullet (`-`/`*`/
 // `+`), an ordered marker (`1.`/`1)`), or a blockquote `>`; an optional task box
 // follows a bullet.
-const ITEM_RE =
+export const ITEM_RE =
   /^(\s*)(([-*+])|(\d+)([.)])|(>))(\s+)(\[[ xX]\]\s+)?(.*)$/;
 
-interface ItemLine {
+/** Which kind of line marker `ITEM_RE` matched. */
+export type ItemKind = "bullet" | "task" | "ordered" | "quote";
+
+export interface ItemLine {
+  kind: ItemKind;
   indent: string;
   /** The full marker text incl. trailing space, ready to prefix the next line. */
   nextMarker: string;
@@ -33,7 +37,7 @@ interface ItemLine {
 }
 
 /** Parse a list/quote item out of a line, or return null if it isn't one. */
-function parseItem(lineText: string): ItemLine | null {
+export function parseItem(lineText: string): ItemLine | null {
   const m = ITEM_RE.exec(lineText);
   if (!m) return null;
   const [, indent, , bullet, num, ordSep, quote, gap, task, body] = m;
@@ -46,7 +50,14 @@ function parseItem(lineText: string): ItemLine | null {
     (bullet ? 1 : num ? num.length + 1 : 1) +
     gap.length +
     (task ? task.length : 0);
-  return { indent, nextMarker, bodyStart, empty: body.length === 0 };
+  const kind: ItemKind = bullet
+    ? task
+      ? "task"
+      : "bullet"
+    : num
+      ? "ordered"
+      : "quote";
+  return { kind, indent, nextMarker, bodyStart, empty: body.length === 0 };
 }
 
 /** Enter: continue the list/quote, or clear an empty item to end the list. */

@@ -38,6 +38,9 @@ Smallest useful product: an Obsidian-lite over a local folder of `.md`.
 - [x] Rust command surface: `pick_vault`, `list_tree`, `read_note`, `write_note`, `start_watcher`.
 - [x] react-arborist file tree fed by `list_tree`, refreshed on watcher events.
 - [x] CodeMirror 6 editor (`@codemirror/lang-markdown`); debounced autosave → `write_note`.
+- [x] Formatting toolbar over the editor (`components/EditorToolbar.tsx`): bold/italic/strike/code,
+      link, H1–H3, bullet/numbered/task/quote, code block, table, divider. Fires the same CodeMirror
+      commands as the ⌘-keys and the `/` menu, and lights the buttons that apply at the caret.
 - [x] External-edit reload: `file-changed` event reloads the open note.
 - [x] SQLite index: `notes` + `notes_fts` (FTS5) + `links` (backlinks) + `tags`. Rebuild on change.
 - [x] New/rename/delete note + folder.

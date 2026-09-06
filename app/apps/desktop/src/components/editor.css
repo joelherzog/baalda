@@ -33,14 +33,22 @@
 .editor-topbar {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  /* Formatting on the left, lock banner + presence on the right. The banner
+     has `flex: 1` below, so it takes the middle when it is there. */
+  justify-content: space-between;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-6) 0 0;
+  /* Left inset mirrors `.cm-content`'s (see lib/editor/theme.ts) so the first
+     format button lines up with the first character of the prose, instead of
+     floating in the gutter. */
+  padding: var(--sp-3) var(--sp-6) 0
+    max(var(--editor-gutter), calc((100% - var(--editor-measure)) / 2));
 }
 .editor-topbar .editor-lockbanner {
   flex: 1 1 auto;
   min-width: 0;
-  margin: 0 0 0 var(--sp-6);
+  /* The row itself now carries the left inset (the formatting toolbar sits
+     there), so the banner no longer adds its own. */
+  margin: 0;
 }
 .editor-topbar .editor-toolbar {
   flex: 0 0 auto;
@@ -195,6 +203,77 @@
   border-color: var(--border-strong);
   font-size: var(--fs-xs);
   font-weight: 700;
+}
+
+/* ---- Formatting toolbar ---- */
+/* One row of icon buttons over the prose column. Everything is a token so the
+   dark theme needs no second block. Never wraps: a narrow window scrolls the
+   row instead of pushing the editor down a line. */
+.editor-format-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.editor-format-toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Groups (text · headings · lists · insert) read as one control each, with a
+   hairline between them instead of a heavier separator element. */
+.editor-format-group {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+}
+.editor-format-group + .editor-format-group {
+  margin-left: var(--sp-1);
+  padding-left: calc(var(--sp-1) + 1px);
+  border-left: 1px solid var(--border);
+}
+
+.editor-format-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease);
+}
+.editor-format-btn svg {
+  width: 16px;
+  height: 16px;
+}
+.editor-format-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.editor-format-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Pressed state comes off the ARIA attribute, so what a screen reader is told
+   and what the eye sees can never disagree. */
+.editor-format-btn[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--accent);
+}
+.editor-format-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
 }
 
 /* ---- Roster popover (click the presence stack) ---- */

@@ -19,7 +19,9 @@ import { useStore } from "../store";
 import * as ipc from "../lib/ipc";
 import { HtmlView } from "./HtmlView";
 import { FilePreview } from "./FilePreview";
+import { activeMarks } from "../lib/editor/activeMarks";
 import { previewKind } from "../lib/preview";
+import { EditorToolbar } from "./EditorToolbar";
 import { relativeAgo, characterSvg } from "./Identity";
 import { agoFromIso, lastEditedTooltip } from "./versionFormat";
 
@@ -338,6 +340,11 @@ export function Editor() {
   // False from the moment a note starts opening until its CodeMirror view is in
   // the DOM. Drives the loading skeleton over the (genuinely empty) pane.
   const [viewMounted, setViewMounted] = useState(false);
+  // Which markdown markers apply at the caret, so the formatting toolbar can
+  // light the matching buttons. A delimited key (see `activeMarks`) rather than
+  // a set: this is recomputed on every selection change and only a changed
+  // string should cost a React render.
+  const [marks, setMarks] = useState("");
   // Editability is held in a Compartment so a lock applied while the note is
   // open can flip the live view read-only without rebuilding it.
   const editableRef = useRef<Compartment | null>(null);
@@ -507,6 +514,12 @@ export function Editor() {
             const line = u.state.doc.lineAt(u.state.selection.main.head).number;
             awareness?.setLocalStateField("activity", { line, at: Date.now() });
           }),
+          // Keep the formatting toolbar's pressed states in step with the caret.
+          EditorView.updateListener.of((u) => {
+            if (!u.selectionSet && !u.docChanged) return;
+            const next = activeMarks(u.state);
+            setMarks((prev) => (prev === next ? prev : next));
+          }),
           // View-only grants / locks: the editor cannot be typed into (spec
           // 04 §4). Compartmented so a live lock change can reconfigure it.
           editable.of(editableExtensions(ro)),
@@ -516,6 +529,9 @@ export function Editor() {
       view = new EditorView({ state, parent: hostRef.current });
       viewRef.current = view;
       setViewMounted(true);
+      // Seed the toolbar's pressed states; the updateListener above only fires
+      // once the caret actually moves.
+      setMarks(activeMarks(view.state));
       setActiveView(view); // let out-of-tree drops embed into this note
       if (!ro) view.focus();
 
@@ -549,6 +565,7 @@ export function Editor() {
       if (view) view.destroy();
       viewRef.current = null;
       editableRef.current = null;
+      setMarks("");
       bridgeRef.current = null;
       hadEditAccessRef.current = false;
       awarenessRef.current = null;
@@ -651,7 +668,7 @@ export function Editor() {
     });
   };
 
-  const showToolbar = peers.length > 0;
+  const showPresence = peers.length > 0;
   // "from 2h ago" for the pill. The panel holds the metadata; the preview state
   // carries only the id + text, so look the timestamp back up here.
   const previewedAt =
@@ -661,81 +678,89 @@ export function Editor() {
 
   return (
     <div className="editor-column">
-      {(readOnly || showToolbar) && (
-        <div className="editor-topbar">
-          {readOnly && (
-            <div
-              className={`editor-lockbanner${lockScope ? " locked" : " viewonly"}`}
-              role="status"
-            >
-              <span className="editor-lockbanner-icon" aria-hidden="true">
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <rect x="4" y="11" width="16" height="10" rx="2" />
-                  <path d="M8 11V7a4 4 0 0 1 8 0v4" />
-                </svg>
-              </span>
-              <span className="editor-lockbanner-text">
-                <strong>{lockScope ? "This note is locked" : "View-only access"}</strong>
-                <span className="editor-lockbanner-sub">
-                  {lockScope
-                    ? "You can read it, but your changes won’t be saved or synced."
-                    : "You can read this note, but you can’t edit it."}
-                </span>
-              </span>
-            </div>
-          )}
-          {showToolbar && (
-            <div className="editor-toolbar">
-              <div
-                className="presence-controls"
-                ref={presenceRef}
-                onMouseEnter={openRoster}
-                onMouseLeave={scheduleCloseRoster}
-                onFocus={openRoster}
-                onBlur={(e) => {
-                  // Ignore focus moving between the stack and a Ping button
-                  // inside the controls; only close when it truly leaves.
-                  if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                    scheduleCloseRoster();
-                  }
-                }}
+      {/* Always present for a note: `.html`, image and PDF paths returned above
+          and never mount a CodeMirror view for the toolbar to act on. */}
+      <div className="editor-topbar">
+        <EditorToolbar
+          getView={() => viewRef.current}
+          // A lock or a view-only grant makes the buttons pointless, and so does
+          // the version-preview overlay: the text under it is a past version the
+          // user is only looking at.
+          disabled={readOnly || previewContent != null}
+          marks={marks}
+        />
+        {readOnly && (
+          <div
+            className={`editor-lockbanner${lockScope ? " locked" : " viewonly"}`}
+            role="status"
+          >
+            <span className="editor-lockbanner-icon" aria-hidden="true">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
               >
-                <PresenceBar
+                <rect x="4" y="11" width="16" height="10" rx="2" />
+                <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+              </svg>
+            </span>
+            <span className="editor-lockbanner-text">
+              <strong>{lockScope ? "This note is locked" : "View-only access"}</strong>
+              <span className="editor-lockbanner-sub">
+                {lockScope
+                  ? "You can read it, but your changes won’t be saved or synced."
+                  : "You can read this note, but you can’t edit it."}
+              </span>
+            </span>
+          </div>
+        )}
+        {showPresence && (
+          <div className="editor-toolbar">
+            <div
+              className="presence-controls"
+              ref={presenceRef}
+              onMouseEnter={openRoster}
+              onMouseLeave={scheduleCloseRoster}
+              onFocus={openRoster}
+              onBlur={(e) => {
+                // Ignore focus moving between the stack and a Ping button
+                // inside the controls; only close when it truly leaves.
+                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                  scheduleCloseRoster();
+                }
+              }}
+            >
+              <PresenceBar
+                peers={peers}
+                open={rosterOpen}
+                onOpen={openRoster}
+                online={
+                  syncEnabled &&
+                  (syncStatus === "synced" ||
+                    syncStatus === "read-only" ||
+                    syncStatus === "connecting")
+                }
+              />
+              {rosterOpen && (
+                <PeerRoster
                   peers={peers}
-                  open={rosterOpen}
-                  onOpen={openRoster}
-                  online={
-                    syncEnabled &&
-                    (syncStatus === "synced" ||
-                      syncStatus === "read-only" ||
-                      syncStatus === "connecting")
-                  }
+                  selfId={myId}
+                  onPing={sendPing}
+                  notePath={notePath}
                 />
-                {rosterOpen && (
-                  <PeerRoster
-                    peers={peers}
-                    selfId={myId}
-                    onPing={sendPing}
-                    notePath={notePath}
-                  />
-                )}
-              </div>
-              {pingFrom && (
-                <span className="ping-toast" role="status">
-                  🔔 {pingFrom} pinged you
-                </span>
               )}
             </div>
-          )}
-        </div>
-      )}
+            {pingFrom && (
+              <span className="ping-toast" role="status">
+                🔔 {pingFrom} pinged you
+              </span>
+            )}
+          </div>
+        )}
+      </div>
       {/* The host must stay mounted whether or not the view exists — the effect
           above needs `hostRef.current` to attach CodeMirror to — so the skeleton
           overlays it rather than replacing it. The wrapper is the positioning
