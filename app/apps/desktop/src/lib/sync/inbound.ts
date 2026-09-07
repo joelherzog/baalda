@@ -363,8 +363,10 @@ export function planInbound(input: InboundInput): InboundPlan {
         // The server moved it and we didn't. THE rename-duplicate fix.
         pushRename(plan, docId, loc, srv);
       } else if (samePath(srv, prev)) {
-        // We moved it and the server didn't — outbound's job (`renamePath`), not
-        // ours. Left alone rather than dragged back.
+        // We moved it and the server didn't — outbound's job, not ours. Left alone
+        // rather than dragged back. `syncStructure` step 2b picks this doc up as a
+        // "stray" and retries `renamePath` until the server agrees; until then the
+        // materialize step is barred from writing an empty file at `srv`.
         continue;
       } else {
         // Both moved, to different places. The vault feed is downstream-only

@@ -54,6 +54,9 @@ beforeEach(() => {
   vi.mocked(ipc.getVaultConfig).mockResolvedValue(null);
   vi.mocked(ipc.writeNote).mockClear();
   vi.mocked(ipc.writeNoteIfMissing).mockClear().mockResolvedValue(true);
+  // Shared across the file: a test that describes a stray doc must not leave its
+  // disk state standing for the next one.
+  vi.mocked(ipc.listNoteTitles).mockClear().mockResolvedValue([]);
   vi.mocked(seedWelcomeContent).mockClear();
 });
 
@@ -365,5 +368,186 @@ describe("VaultRegistry.registerNote", () => {
     const again = await reg.registerNote("Ideas/New.md", "New");
     expect(again).toEqual(mapping);
     expect(createNote).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A local rename/move the server never learned about.
+//
+// The file moves on disk first (Rust, by doc_id) and the server row moves second.
+// When that second step is lost — offline, a 400 for a destination folder the
+// server doesn't know, an error that used to go only to the console — the row
+// keeps the OLD path. Reconcile then saw a server path with no file under it and
+// materialized an empty one beside the real note, while the note's new path looked
+// unregistered and was registered a second time: one rename, two files.
+// ---------------------------------------------------------------------------
+
+/** Build a full vault tree from vault-relative note paths. */
+function treeOf(paths: string[]): TreeNode {
+  const root: TreeNode = { id: "root", name: "vault", path: "", isDir: true, children: [] };
+  for (const p of paths) {
+    const segs = p.split("/");
+    let node = root;
+    for (let i = 0; i < segs.length; i++) {
+      const isDir = i < segs.length - 1;
+      const path = segs.slice(0, i + 1).join("/");
+      let next = (node.children ??= []).find((c) => c.path === path);
+      if (!next) {
+        next = { id: path, name: segs[i], path, isDir, children: isDir ? [] : undefined };
+        node.children.push(next);
+      }
+      node = next;
+    }
+  }
+  return root;
+}
+
+function strayApi(opts: {
+  notes: Array<{ id: string; rel_path: string }>;
+  folders?: Array<{ id: string; path: string }>;
+  updateNote?: (id: string, input: Record<string, unknown>) => Promise<unknown>;
+}) {
+  const folders = opts.folders ?? [];
+  const createNote = vi.fn(async (input: { relPath: string }) => ({
+    id: `note-${input.relPath}`,
+    rel_path: input.relPath,
+  }));
+  const createFolder = vi.fn(async (input: { path: string }) => {
+    const f = { id: `folder-${input.path}`, path: input.path };
+    folders.push(f);
+    return f;
+  });
+  const updateNote = vi.fn(
+    opts.updateNote ??
+      (async (id: string, input: Record<string, unknown>) => ({
+        id,
+        rel_path: input.relPath as string,
+      })),
+  );
+  const api = {
+    listVaults: vi.fn(async () => [{ id: "v1", name: "acme", organization_id: ORG }]),
+    listFolders: vi.fn(async () => folders),
+    listFolderRegistry: vi.fn(async () => ({ folders, tombstones: [] })),
+    createFolder,
+    listNotes: vi.fn(async () => opts.notes),
+    listNoteRegistry: vi.fn(async () => ({ notes: opts.notes, tombstones: [] })),
+    createNote,
+    updateNote,
+  } as unknown as ApiClient;
+  return { api, createNote, createFolder, updateNote };
+}
+
+describe("VaultRegistry — a local move the server hasn't learned about", () => {
+  it("moves the server row onto the file instead of duplicating the note", async () => {
+    // Server still says Notes/A.md; the file is at Notes/B.md under the same
+    // doc_id (Rust renames by id, which is what makes this provable).
+    const { api, createNote, updateNote } = strayApi({
+      notes: [{ id: "n1", rel_path: "Notes/A.md" }],
+      folders: [{ id: "f-notes", path: "Notes" }],
+    });
+    vi.mocked(ipc.listNoteTitles).mockResolvedValue([
+      { id: "n1", path: "Notes/B.md", title: "B" },
+    ]);
+    const reg = new VaultRegistry(api);
+    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "acme" }, treeOf(["Notes/B.md"]));
+
+    expect(updateNote).toHaveBeenCalledWith("n1", {
+      relPath: "Notes/B.md",
+      folderId: "f-notes",
+    });
+    // Neither half of the duplicate: no empty file at the stale path…
+    expect(vi.mocked(ipc.writeNoteIfMissing)).not.toHaveBeenCalled();
+    // …and no second row for the note's real path.
+    expect(createNote).not.toHaveBeenCalled();
+    expect(reg.getMapping("Notes/B.md")).toEqual({ vaultId: "v1", docId: "n1" });
+    expect(reg.getMapping("Notes/A.md")).toBeNull();
+    expect(reg.failures()).toEqual([]);
+  });
+
+  it("writes no empty twin when the move is refused, and records the failure", async () => {
+    const { api, createNote, updateNote } = strayApi({
+      notes: [{ id: "n1", rel_path: "Notes/A.md" }],
+      folders: [{ id: "f-notes", path: "Notes" }],
+      updateNote: async () => {
+        throw new Error("offline");
+      },
+    });
+    vi.mocked(ipc.listNoteTitles).mockResolvedValue([
+      { id: "n1", path: "Notes/B.md", title: "B" },
+    ]);
+    const reg = new VaultRegistry(api);
+    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "acme" }, treeOf(["Notes/B.md"]));
+
+    expect(updateNote).toHaveBeenCalled();
+    expect(vi.mocked(ipc.writeNoteIfMissing)).not.toHaveBeenCalled();
+    expect(createNote).not.toHaveBeenCalled();
+    // The mapping stays on the SERVER's path: that is the self-consistent state,
+    // and it is what stops inbound reading the untouched row as a remote move and
+    // dragging the user's rename back on the next pass.
+    expect(reg.getMapping("Notes/A.md")).toEqual({ vaultId: "v1", docId: "n1" });
+    expect(reg.failures().map((f) => f.kind)).toContain("move");
+  });
+
+  it("registers a destination folder the server doesn't know before moving into it", async () => {
+    // The everyday trigger: drag a note into a folder that hasn't registered yet.
+    // Sending folderId: null with a nested relPath makes the server refuse with
+    // `No folder at "New" — create it first`, and the move is lost.
+    const { api, createFolder, updateNote } = strayApi({
+      notes: [{ id: "n1", rel_path: "A.md" }],
+      folders: [],
+    });
+    vi.mocked(ipc.listNoteTitles).mockResolvedValue([{ id: "n1", path: "New/A.md", title: "A" }]);
+    const reg = new VaultRegistry(api);
+    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "acme" }, treeOf(["New/A.md"]));
+
+    expect(createFolder).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "New", vaultId: "v1" }),
+    );
+    expect(updateNote).toHaveBeenCalledWith("n1", {
+      relPath: "New/A.md",
+      folderId: "folder-New",
+    });
+    expect(vi.mocked(ipc.writeNoteIfMissing)).not.toHaveBeenCalled();
+  });
+
+  it("never moves a row onto a path the filesystem walk doesn't show", async () => {
+    // The SQLite index is derived state and can lag the filesystem. Trusting it
+    // alone would move the server row to a path with no file under it, stranding
+    // the note where no device can see it — worse than the twin we guard against.
+    const { api, updateNote } = strayApi({
+      notes: [{ id: "n1", rel_path: "A.md" }],
+    });
+    vi.mocked(ipc.listNoteTitles).mockResolvedValue([
+      { id: "n1", path: "Ghost.md", title: "gone" },
+    ]);
+    const reg = new VaultRegistry(api);
+    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "acme" }, treeOf(["A.md"]));
+
+    expect(updateNote).not.toHaveBeenCalled();
+    expect(reg.getMapping("A.md")).toEqual({ vaultId: "v1", docId: "n1" });
+  });
+
+  it("propagates a rename when the map holds another spelling of the old path", async () => {
+    // macOS/Windows store one file per case-insensitive name, so the map can hold
+    // the server's spelling of a path the user typed differently. The exact-only
+    // lookup this used to do made renamePath a silent no-op — the move never left
+    // the device, and the twin appeared on the next pull.
+    const { api, updateNote } = strayApi({
+      notes: [{ id: "n1", rel_path: "notes/a.md" }],
+      folders: [{ id: "f-notes", path: "notes" }],
+    });
+    vi.mocked(ipc.listNoteTitles).mockResolvedValue([
+      { id: "n1", path: "notes/a.md", title: "A" },
+    ]);
+    const reg = new VaultRegistry(api);
+    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "acme" }, treeOf(["notes/a.md"]));
+    expect(updateNote).not.toHaveBeenCalled(); // nothing stray yet
+
+    await reg.renamePath("Notes/A.md", "notes/b.md");
+    expect(updateNote).toHaveBeenCalledWith("n1", {
+      relPath: "notes/b.md",
+      folderId: "f-notes",
+    });
+    expect(reg.getMapping("notes/b.md")).toEqual({ vaultId: "v1", docId: "n1" });
   });
 });
