@@ -833,10 +833,15 @@ export function FileTree() {
       await ipc.renamePath(oldPath, newPath, useStore.getState().vault?.epoch);
       // Propagate the rename/move to the server (folder subtree or single note;
       // doc_ids are preserved) so teammates see it live.
+      // The file has already moved on disk. If the server never learns about it,
+      // its row keeps the old path — and the next reconcile pass sees a path with
+      // no file under it. That is the empty-twin duplicate, so say so rather than
+      // logging to a console nobody has open; the pass retries the move itself.
       try {
         await syncManager.registry.renamePath(oldPath, newPath);
       } catch (e) {
         console.warn("[sync] renamePath failed", oldPath, e);
+        toast(`Renamed on this device — syncing "${newName}" will retry.`, "error");
       }
       // Keep the item's rank (and its subtree's arrangement) across the rename.
       const store = useStore.getState();
@@ -916,10 +921,13 @@ export function FileTree() {
       if (from[i] === to[i]) continue;
       try {
         await ipc.renamePath(from[i], to[i], moveEpoch);
+        // As in the rename above: a move the server never learned about is what
+        // grows an empty twin at the old path on the next pass.
         try {
           await syncManager.registry.renamePath(from[i], to[i]);
         } catch (e) {
           console.warn("[sync] move propagate failed", from[i], e);
+          toast(`Moved on this device — syncing "${basename(to[i])}" will retry.`, "error");
         }
         movedOnDisk = true;
         useStore.getState().remapTabs(from[i], to[i]);

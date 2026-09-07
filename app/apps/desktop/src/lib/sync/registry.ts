@@ -36,7 +36,7 @@ import * as ipc from "../ipc";
 import type { TreeNode } from "../ipc";
 import { seedWelcomeContent } from "../vault/seed";
 import { Checkpointer, checkpointBatchFor } from "./checkpoint";
-import { planInbound } from "./inbound";
+import { planInbound, samePath } from "./inbound";
 import { REGISTRY_CONCURRENCY, runPool, withRetry } from "./pool";
 import { nullProgressSink, type SyncProgressSink } from "./progress";
 import { toast } from "../toast";
@@ -155,7 +155,7 @@ export interface ReconcileInput {
 /** A folder/note that could NOT be registered, after retries. Surfaced so the
  *  vault is never reported fully synced while an arbitrary subset is local-only. */
 export interface RegistryFailure {
-  kind: "folder" | "note" | "materialize" | "inbound" | "orphan";
+  kind: "folder" | "note" | "move" | "materialize" | "inbound" | "orphan";
   /** Vault-relative path. */
   path: string;
   /** Intended docId, when known (notes) — phase 3 keys its badge by this. */
@@ -267,6 +267,16 @@ export class VaultRegistry {
   private host: InboundHost | null = null;
   /** Local note paths the current pass must not re-register (see `InboundPlan.suppress`). */
   private inboundSuppressed = new Set<string>();
+  /**
+   * docIds whose move is in flight to the server right now.
+   *
+   * A rename moves the file on disk first, and Rust's watcher event fans out to a
+   * 150ms-debounced pull — while the move itself is still a network round-trip.
+   * That pull reads the PRE-move listing, sees a server path with no file under
+   * it, and materializes an empty one beside the real note. Skipping these docs
+   * for the pass closes the window.
+   */
+  private movesInFlight = new Set<string>();
   /** Everything that could not be registered in the last run. */
   private failed: RegistryFailure[] = [];
   /** Set when the server refused on a plan limit: the rest of the run is
@@ -488,6 +498,9 @@ export class VaultRegistry {
     this.baselineVaultId = null;
     this.failed = [];
     this.limitReached = null;
+    // An in-flight marker that outlived its vault would bar the NEXT vault from
+    // materializing whatever path that docId happens to sit at over there.
+    this.movesInFlight.clear();
     this.bound = null;
     this.progress = nullProgressSink;
   }
@@ -1431,6 +1444,44 @@ export class VaultRegistry {
       mutated = true;
     }
 
+    // A doc whose FILE sits at one path while the server's row still names another:
+    // we renamed or moved it locally and the propagation never landed (offline, a
+    // 400 for a destination folder the server doesn't know yet, an error that used
+    // to be swallowed to the console). Provable rather than guessed, because Rust's
+    // `rename_note` rewrites paths BY ID — the local index still keys the file
+    // under the same doc_id it had before the rename.
+    //
+    // Left undetected this is the empty-twin bug: the server's path has no file, so
+    // step 5 materializes an empty one beside the real note, and the real note's
+    // path looks unregistered, so step 3 registers it a SECOND time. Inbound
+    // already names this case and correctly declines it as "outbound's job"
+    // (`inbound.ts`, the `samePath(srv, prev)` branch) — step 2b below is that job.
+    //
+    // Inbound has already run and re-read the tree by now, so a divergence left
+    // here cannot be a server-side move we simply haven't applied.
+    const diskPathByDocId = new Map<string, string>();
+    for (const t of titles) diskPathByDocId.set(t.id, t.path);
+    /** docId → {where the server thinks it is, where the file really is}. */
+    const strayDocs = new Map<string, { server: string; disk: string }>();
+    for (const n of serverNotes) {
+      const srv = noteRelPath(n);
+      if (!srv) continue;
+      const docId = noteDocId(n);
+      const disk = diskPathByDocId.get(docId);
+      // A note this device MATERIALIZED carries a fresh local index id that never
+      // equals the server's doc_id, so it simply doesn't appear here — the guard
+      // stays silent rather than guessing (see the `byPath` note in `applyInbound`).
+      if (disk === undefined || samePath(disk, srv)) continue;
+      // The index is derived state and can lag the filesystem. `notes` is the
+      // authoritative walk, so require the file to really be there — moving a
+      // server row onto a path with nothing under it would strand the note where
+      // no device can see it, which is worse than the twin this guards against.
+      if (!localNotePathCi.has(disk.toLowerCase())) continue;
+      strayDocs.set(docId, { server: srv, disk });
+    }
+    /** The disk side of every stray, so step 3 doesn't register the note twice. */
+    const strayDiskCi = new Set([...strayDocs.values()].map((v) => v.disk.toLowerCase()));
+
     // `inboundSuppressed` is what stops the ghost. A note the server has DELETED
     // (or that we've lost access to) is still on disk, so it looks "missing from
     // the server" here and used to be re-created — which the server answers 201 to
@@ -1438,10 +1489,17 @@ export class VaultRegistry {
     const missingNotes = notes.filter(
       (n) =>
         !resolvedNotePathsCi.has(n.path.toLowerCase()) &&
-        !this.inboundSuppressed.has(n.path),
+        !this.inboundSuppressed.has(n.path) &&
+        // A stray's file is not an unregistered note — it is a registered one the
+        // server has misplaced. Creating it here would fork the note into a second
+        // row; step 2b moves the existing row onto this path instead.
+        !strayDiskCi.has(n.path.toLowerCase()),
     );
 
-    this.sink.phase("registering", missingFolders.length + missingNotes.length);
+    this.sink.phase(
+      "registering",
+      missingFolders.length + missingNotes.length + strayDocs.size,
+    );
 
     const titleByPath = new Map(titles.map((t) => [t.path, t.title] as const));
     // The local index already keyed each note by a stable doc_id. Supply it as
@@ -1490,6 +1548,39 @@ export class VaultRegistry {
         },
         { concurrency: REGISTRY_CONCURRENCY, shouldStop: () => this.stopRun() },
       );
+    }
+    if (this.stale()) return mutated;
+
+    // 2b. Push the strays: local moves the server never learned about. After the
+    //     folders above, so a note dragged into a brand-new folder has somewhere to
+    //     land, and before the note pool, so a moved note is not also registered at
+    //     its new path. Sequential: there are normally none, and a handful at most.
+    let movedStray = false;
+    for (const [docId, stray] of [...strayDocs]) {
+      if (this.stopRun()) break;
+      await this.renamePath(stray.server, stray.disk);
+      if (this.stale()) return mutated;
+      // `renamePath` remaps the doc only when the SERVER accepted the move, so this
+      // is the accept test. A refusal keeps the mapping (and therefore the next
+      // pass's baseline) on the server's path, which is the self-consistent state:
+      // inbound reads it as "they moved it, we didn't" and leaves the file alone,
+      // and the next pass retries the move from here.
+      if (this.byDocId.get(docId) !== stray.disk) {
+        this.sink.item("failed");
+        continue;
+      }
+      strayDocs.delete(docId);
+      resolvedNotePaths.delete(stray.server);
+      resolvedNotePaths.add(stray.disk);
+      movedStray = true;
+      mutated = true;
+      this.sink.item("ok");
+    }
+    if (movedStray) {
+      // Re-derived rather than patched key by key: dropping `server`'s folded key
+      // directly would un-resolve a different doc that happens to share it.
+      resolvedNotePathsCi.clear();
+      for (const rp of resolvedNotePaths) resolvedNotePathsCi.add(rp.toLowerCase());
     }
     if (this.stale()) return mutated;
 
@@ -1593,9 +1684,22 @@ export class VaultRegistry {
     // Case-insensitive, or a note whose server spelling differs from the one on
     // disk would be "server-only" here and get an empty file written at the other
     // spelling — which on a case-insensitive filesystem is the SAME file.
+    //
+    // And never against a path the server has merely MISPLACED. A path with no
+    // file under it is only "server-only" if no file on disk is that doc already:
+    // a stray whose move above was refused, or one whose move is still in flight
+    // from a concurrent rename, still has its content at another path, and writing
+    // an empty file at this one is precisely the duplicate the user sees.
     const localNotePaths = new Set(notes.map((n) => n.path.toLowerCase()));
+    const misplacedCi = new Set<string>();
+    for (const stray of strayDocs.values()) misplacedCi.add(stray.server.toLowerCase());
+    for (const docId of this.movesInFlight) {
+      // `byDocId` still holds the pre-move path until the server accepts.
+      const rp = this.byDocId.get(docId);
+      if (rp) misplacedCi.add(rp.toLowerCase());
+    }
     const toMaterialize = [...resolvedNotePaths].filter(
-      (rp) => !localNotePaths.has(rp.toLowerCase()),
+      (rp) => !localNotePaths.has(rp.toLowerCase()) && !misplacedCi.has(rp.toLowerCase()),
     );
     this.sink.addTotal(toMaterialize.length);
     await runPool(
@@ -1733,50 +1837,114 @@ export class VaultRegistry {
   }
 
   /**
+   * The server folder id for `relPath`'s parent directory, registering the whole
+   * missing chain (parents first) when the server doesn't know it yet.
+   *
+   * Sending `folderId: null` alongside a NESTED `relPath` is not a neutral
+   * default. The server resolves the parent from the path and refuses with
+   * `No folder at "…" — create it first` (tree-ops.ts `resolveParentFolder`), and
+   * that 400 is the commonest way a move was lost: drag a note into a folder that
+   * hasn't registered yet and the file moved on disk while the row never did.
+   */
+  private async ensureParentFolder(relPath: string): Promise<string | null> {
+    const dir = parentDir(relPath);
+    if (!dir) return null; // the vault root has no folder row
+    const known = this.canonicalFolderPath(dir);
+    if (known) return this.folderByPath.get(known) ?? null;
+    // Depth-first: `registerFolder` resolves its OWN parent from `folderByPath`,
+    // so the chain has to be created from the top down.
+    await this.ensureParentFolder(dir);
+    if (this.stale()) return null;
+    return this.registerFolder(dir, baseName(dir));
+  }
+
+  /**
    * Propagate a local rename/move to the server. Handles both a folder (with its
    * whole subtree of paths) and a single note. doc_ids never change — only the
    * path columns move — so open docs and backlinks survive (spec invariant).
+   *
+   * Failures are RECORDED, never swallowed. A move that did not reach the server
+   * leaves the row at its old path, and the next pass then sees a server path with
+   * no file under it — which is exactly how a rename grew an empty twin beside the
+   * real note, while the note's new path looked unregistered and was registered a
+   * second time. `syncStructure` retries such a move from the baseline; this
+   * failure is what keeps the vault from reporting itself fully synced meanwhile.
+   *
+   * The maps move only once the SERVER has accepted. Remapping on a failure would
+   * make the next pass's baseline say "the file belongs where it now is", and
+   * inbound would then read the server's untouched row as a remote move and drag
+   * the user's rename back (`inbound.ts`, the `samePath(loc, prev)` branch).
    */
   async renamePath(oldPath: string, newPath: string): Promise<void> {
     if (this.stale()) return;
     const vaultId = this.serverVaultId;
     if (!vaultId) return;
-    const folderId = this.folderByPath.get(oldPath);
-    if (folderId) {
+    // Case-insensitive, like `registerFolder`/`registerNote`. The map may hold the
+    // server's spelling of a path the user typed differently, and the exact-only
+    // lookup this used to do then made the whole method a silent no-op — the move
+    // never left the device, and the twin turned up on the next pull.
+    const folderKey = this.canonicalFolderPath(oldPath);
+    const folderId = folderKey === null ? undefined : this.folderByPath.get(folderKey);
+    if (folderKey !== null && folderId) {
       // Folder move: rewrite the server subtree, then the local prefix maps.
-      const parentId = this.folderByPath.get(parentDir(newPath)) ?? null;
+      const parentId = await this.ensureParentFolder(newPath);
+      if (this.stale() || this.serverVaultId !== vaultId) return;
+      // Every note under the folder moves with it, so they all need the guard.
+      const moving: string[] = [];
+      for (const [rp, m] of this.byPath) {
+        if (rp === folderKey || rp.startsWith(folderKey + "/")) moving.push(m.docId);
+      }
+      for (const d of moving) this.movesInFlight.add(d);
       try {
         await this.api.updateFolder(folderId, { name: baseName(newPath), path: newPath, parentId });
       } catch (e) {
-        console.error("[registry] updateFolder failed", oldPath, e);
+        this.recordFailure({
+          kind: "move",
+          path: newPath,
+          docId: null,
+          reason: reasonOf(e),
+          code: errorCode(e),
+        });
         return;
+      } finally {
+        for (const d of moving) this.movesInFlight.delete(d);
       }
       // The maps may belong to a different vault by now — remapping them would
       // rewrite that vault's paths with this one's move.
       if (this.stale() || this.serverVaultId !== vaultId) return;
-      this.folderByPath = remapPrefix(this.folderByPath, oldPath, newPath);
-      this.byPath = remapPrefix(this.byPath, oldPath, newPath);
+      this.folderByPath = remapPrefix(this.folderByPath, folderKey, newPath);
+      this.byPath = remapPrefix(this.byPath, folderKey, newPath);
       this.rebuildByDocId();
       this.persist();
       this.notifyMapChanged();
       return;
     }
-    const mapping = this.byPath.get(oldPath);
-    if (mapping) {
-      const newFolderId = this.folderByPath.get(parentDir(newPath)) ?? null;
-      try {
-        await this.api.updateNote(mapping.docId, { relPath: newPath, folderId: newFolderId });
-      } catch (e) {
-        console.error("[registry] updateNote failed", oldPath, e);
-        return;
-      }
-      if (this.stale() || this.serverVaultId !== vaultId) return;
-      this.byPath.delete(oldPath);
-      this.byPath.set(newPath, mapping);
-      this.byDocId.set(mapping.docId, newPath);
-      this.persist();
-      this.notifyMapChanged();
+    const noteKey = this.canonicalNotePath(oldPath);
+    const mapping = noteKey === null ? undefined : this.byPath.get(noteKey);
+    if (noteKey === null || !mapping) return;
+    const newFolderId = await this.ensureParentFolder(newPath);
+    if (this.stale() || this.serverVaultId !== vaultId) return;
+    this.movesInFlight.add(mapping.docId);
+    try {
+      await this.api.updateNote(mapping.docId, { relPath: newPath, folderId: newFolderId });
+    } catch (e) {
+      this.recordFailure({
+        kind: "move",
+        path: newPath,
+        docId: mapping.docId,
+        reason: reasonOf(e),
+        code: errorCode(e),
+      });
+      return;
+    } finally {
+      this.movesInFlight.delete(mapping.docId);
     }
+    if (this.stale() || this.serverVaultId !== vaultId) return;
+    this.byPath.delete(noteKey);
+    this.byPath.set(newPath, mapping);
+    this.byDocId.set(mapping.docId, newPath);
+    this.persist();
+    this.notifyMapChanged();
   }
 
   /**
