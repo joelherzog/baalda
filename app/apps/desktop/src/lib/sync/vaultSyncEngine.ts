@@ -146,6 +146,13 @@ export interface VaultSyncEngineOptions {
    * pushed no matter what the local `pushed` checkpoint claims.
    */
   onServerEmpty?: (docIds: string[], truncated: boolean) => void;
+  /**
+   * The server found THIS device ahead on these readable docs (`ready.behind`):
+   * our manifest carries ops it has never received. Fired on every `ready`,
+   * right before {@link onServerEmpty}, so the content run that `ready` starts
+   * already has them queued.
+   */
+  onServerBehind?: (docIds: string[]) => void;
   /** Injected in tests. Defaults to the global WebSocket. */
   wsFactory?: WsFactory;
   /** Backoff bounds (ms). */
@@ -202,6 +209,7 @@ export class VaultSyncEngine {
   private readonly onInboundProgress?: (done: number, total: number) => void;
   private readonly onInboundIdle?: () => void;
   private readonly onServerEmpty?: (docIds: string[], truncated: boolean) => void;
+  private readonly onServerBehind?: (docIds: string[]) => void;
   private readonly wsFactory: WsFactory;
   private readonly inboundMaxBytes: number;
   private readonly baseMs: number;
@@ -269,6 +277,7 @@ export class VaultSyncEngine {
     this.onInboundProgress = opts.onInboundProgress;
     this.onInboundIdle = opts.onInboundIdle;
     this.onServerEmpty = opts.onServerEmpty;
+    this.onServerBehind = opts.onServerBehind;
     this.inboundMaxBytes = opts.inboundQueueMaxBytes ?? INBOUND_QUEUE_MAX_BYTES;
     this.wsFactory =
       opts.wsFactory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
@@ -390,6 +399,11 @@ export class VaultSyncEngine {
 
   private setStatus(s: VaultSyncStatus): void {
     if (this.status === s) return;
+    // One line per transition: a reconnect loop is invisible without it, since
+    // neither the connect nor the drop otherwise logs anything.
+    console.info(
+      `[vault-sync] ${this.vaultId.slice(0, 8)} ${this.status} → ${s} (attempt ${this.attempt})`,
+    );
     this.status = s;
     this.onStatus?.(s);
   }
@@ -408,8 +422,17 @@ export class VaultSyncEngine {
 
     ws.onopen = () => void this.onOpen();
     ws.onmessage = (ev) => void this.onMessage(ev.data);
-    ws.onclose = () => this.onDisconnect();
-    ws.onerror = () => this.onDisconnect();
+    ws.onclose = (ev) => {
+      const e = ev as { code?: number; reason?: string; wasClean?: boolean } | undefined;
+      console.warn(
+        `[vault-sync] socket closed code=${e?.code ?? "?"} reason=${JSON.stringify(e?.reason ?? "")} clean=${e?.wasClean ?? "?"}`,
+      );
+      this.onDisconnect();
+    };
+    ws.onerror = () => {
+      console.warn("[vault-sync] socket error");
+      this.onDisconnect();
+    };
   }
 
   private async onOpen(): Promise<void> {
@@ -490,6 +513,7 @@ export class VaultSyncEngine {
         // BEFORE the idle signal: `maybeSignalIdle` is what starts the content
         // run, and a run that starts without this frame's `empty` list would
         // work from the stale one (or none at all on a first connect).
+        this.onServerBehind?.(control.behind ?? []);
         this.onServerEmpty?.(control.empty ?? [], control.emptyTruncated === true);
         // `ready` routinely arrives AFTER the last backfill frame has already been
         // applied, so this is the edge that settles the download phase. Checking

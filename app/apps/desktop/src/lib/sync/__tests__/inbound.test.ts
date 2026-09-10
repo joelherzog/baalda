@@ -54,9 +54,67 @@ describe("planInbound — folders", () => {
 
   it("never deletes a local folder the server merely no longer lists", () => {
     // The folder listing is permission-filtered, so "absent" alone is
-    // irreducibly ambiguous — only a tombstone proves a delete.
+    // irreducibly ambiguous for a folder we never recorded a server id for: it
+    // could be a brand-new local folder. Only an id WE recorded (see the
+    // revocation cases below) or a tombstone lets the plan act.
     const p = plan({ localFolders: new Set(["Gone"]) });
     expect(p).toMatchObject({ createFolders: [], removeFolders: [], trash: [], renames: [] });
+  });
+
+  it("removes a recorded folder that left the listing without a tombstone — access revoked", () => {
+    // THE leftover-folder bug: an admin made "Getting Started" private. Its
+    // notes left as `revoked`, but the folder was neither tombstoned nor moved,
+    // so the emptied directory stayed in the teammate's sidebar forever.
+    const p = plan({
+      localFolders: new Set(["Getting Started", "Getting Started/Deep", "Concepts"]),
+      localFolderIds: new Map([
+        ["Getting Started", "f-gs"],
+        ["Getting Started/Deep", "f-deep"],
+        ["Concepts", "f-c"],
+      ]),
+      serverFolders: new Set(["Concepts"]),
+      serverFolderIds: new Map([["f-c", "Concepts"]]),
+    });
+    // Children first, so the subtree unwinds bottom-up.
+    expect(p.removeFolders).toEqual(["Getting Started/Deep", "Getting Started"]);
+    expect(p.rejected).toEqual([]);
+  });
+
+  it("leaves a revoked folder alone when the server did not answer about folder deletions", () => {
+    // `null` tombstones = "I don't know" — a truncated listing looks exactly
+    // like a mass revoke, and the safe reading of absence is then nothing.
+    const p = plan({
+      localFolders: new Set(["Getting Started"]),
+      localFolderIds: new Map([["Getting Started", "f-gs"]]),
+      folderTombstones: null,
+    });
+    expect(p.removeFolders).toEqual([]);
+  });
+
+  it("does not read a revoked folder as revoked once the server re-created its path", () => {
+    // Someone made a NEW "Getting Started" (fresh id) after ours went private:
+    // the directory on disk is now that folder's, and the outbound half adopts it.
+    const p = plan({
+      localFolders: new Set(["Getting Started"]),
+      localFolderIds: new Map([["Getting Started", "f-old"]]),
+      serverFolders: new Set(["Getting Started"]),
+      serverFolderIds: new Map([["f-new", "Getting Started"]]),
+    });
+    expect(p.removeFolders).toEqual([]);
+  });
+
+  it("refuses a mass folder revocation past the safety limit, and reports every one", () => {
+    const localFolders = new Set<string>();
+    const localFolderIds = new Map<string, string>();
+    for (let i = 0; i < 21; i++) {
+      localFolders.add(`F${i}`);
+      localFolderIds.set(`F${i}`, `f${i}`);
+    }
+    const p = plan({ localFolders, localFolderIds });
+    expect(p.removeFolders).toEqual([]);
+    expect(p.rejected).toHaveLength(21);
+    expect(p.rejected[0]).toMatchObject({ kind: "folder", path: "F0" });
+    expect(p.rejected[0].reason).toMatch(/exceeds the 20 safety limit/);
   });
 
   it("removes a local folder whose recorded id is tombstoned, children first", () => {
@@ -69,6 +127,10 @@ describe("planInbound — folders", () => {
         ["A/B", "fb"],
         ["Keep", "fk"],
       ]),
+      // `Keep` is still listed; a recorded id that is NEITHER listed nor
+      // tombstoned would be a revocation (its own cases above).
+      serverFolders: new Set(["Keep"]),
+      serverFolderIds: new Map([["fk", "Keep"]]),
       folderTombstones: new Set(["fa", "fb"]),
     });
     expect(p.removeFolders).toEqual(["A/B", "A"]);
@@ -121,6 +183,59 @@ describe("planInbound — folders", () => {
       localFolderIds: new Map([["Projects/vid", "f1"]]),
       serverFolders: new Set(["Projects/vid", "Archive/vid"]),
       serverFolderIds: new Map([["f1", "Archive/vid"], ["f2", "Projects/vid"]]),
+    });
+    expect(p.removeFolders).toEqual([]);
+  });
+
+  // The #98 heartbeat. Disk says `Projects/community`, the server says
+  // `Projects/Community` (a rename-by-case on one device, or migration 023
+  // merging case-duplicated rows), and the server holds an EMPTY folder under
+  // it. On a case-insensitive filesystem those are one directory, so neither
+  // half of the plan may act on the spelling alone — creating it and removing it
+  // alternated on every pull, forever, each pass re-triggering the next through
+  // the watcher.
+  it("treats a folder that differs from the server only by case as already present", () => {
+    const p = plan({
+      serverFolders: new Set(["Projects/Community", "Projects/Community/Content/pipeline"]),
+      localFolders: new Set(["Projects/community", "Projects/community/Content/pipeline"]),
+    });
+    expect(p.createFolders).toEqual([]);
+    expect(p.removeFolders).toEqual([]);
+  });
+
+  it("does not read a spelling disagreement as a remote MOVE of the folder", () => {
+    // The id recorded under the local spelling now "lives" at the server's
+    // spelling of the same directory. That is not a move: nothing to remove.
+    const p = plan({
+      localFolderIds: new Map([["Projects/community/Content/pipeline", "f-pipe"]]),
+      serverFolderIds: new Map([["f-pipe", "Projects/Community/Content/pipeline"]]),
+      localFolders: new Set(["Projects/community", "Projects/community/Content/pipeline"]),
+      serverFolders: new Set(["Projects/Community", "Projects/Community/Content/pipeline"]),
+    });
+    expect(p.removeFolders).toEqual([]);
+    expect(p.createFolders).toEqual([]);
+  });
+
+  it("still removes the old directory when the server moved the folder for real", () => {
+    // Guard against over-correcting: a genuine move (different name, not just
+    // different case) must keep working exactly as before.
+    const p = plan({
+      localFolderIds: new Map([["Projects/vid", "f1"]]),
+      serverFolderIds: new Map([["f1", "Archive/vid"]]),
+      localFolders: new Set(["Projects", "Projects/vid"]),
+      serverFolders: new Set(["Projects", "Archive", "Archive/vid"]),
+    });
+    expect(p.removeFolders).toEqual(["Projects/vid"]);
+  });
+
+  it("matches a tombstoned folder's local spelling against the server's re-creation case-insensitively", () => {
+    // Deleted under one spelling, re-created under another: same directory on
+    // disk, so the tombstone must not remove it.
+    const p = plan({
+      localFolderIds: new Map([["Archive", "old-id"]]),
+      folderTombstones: new Set(["old-id"]),
+      localFolders: new Set(["Archive"]),
+      serverFolders: new Set(["archive"]),
     });
     expect(p.removeFolders).toEqual([]);
   });

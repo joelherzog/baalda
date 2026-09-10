@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiClient, ApiError } from "../api";
+import { ApiClient, ApiError, HEALTH_TIMEOUT_MS } from "../api";
 
 interface Call {
   url: string;
@@ -156,7 +156,127 @@ describe("ApiClient against a mocked fetch", () => {
   it("getAuthMethods falls back to email-only when the endpoint 404s", async () => {
     const { impl } = fakeFetch(() => ({ status: 404, json: { error: "not found" } }));
     const api = new ApiClient({ baseUrl: "http://localhost:3010", fetchImpl: impl });
-    expect(await api.getAuthMethods()).toEqual({ emailPassword: true, google: false });
+    expect(await api.getAuthMethods()).toEqual({
+      emailPassword: true,
+      google: false,
+      passwordReset: false,
+      invitationEmail: false,
+    });
+  });
+
+  it("getAuthMethods reads an older server's two-field answer as no new capabilities", async () => {
+    // The whole point of failing closed per FIELD: a server that predates
+    // password reset must not be offered as one that can send the email.
+    const { impl } = fakeFetch(() => ({ json: { emailPassword: true, google: true } }));
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", fetchImpl: impl });
+    expect(await api.getAuthMethods()).toEqual({
+      emailPassword: true,
+      google: true,
+      passwordReset: false,
+      invitationEmail: false,
+    });
+  });
+
+  it("getAuthMethods passes through the full capability set", async () => {
+    const { impl } = fakeFetch(() => ({
+      json: {
+        emailPassword: true,
+        google: false,
+        passwordReset: true,
+        invitationEmail: true,
+      },
+    }));
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", fetchImpl: impl });
+    expect(await api.getAuthMethods()).toEqual({
+      emailPassword: true,
+      google: false,
+      passwordReset: true,
+      invitationEmail: true,
+    });
+  });
+
+  it("requestPasswordReset posts only the email — never a redirectTo", async () => {
+    // A client-supplied redirect target on a reset flow is an open redirect
+    // wearing a reset token; the server builds its own link.
+    const { impl, calls } = fakeFetch(() => ({ json: { status: true, message: "ok" } }));
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", fetchImpl: impl });
+    await api.requestPasswordReset("ada@team.com");
+    expect(calls[0].url).toContain("/api/password-reset/request");
+    expect(calls[0].method).toBe("POST");
+    expect(calls[0].body).toEqual({ email: "ada@team.com" });
+  });
+
+  it("cancelInvitation posts the id to Better Auth's cancel route", async () => {
+    const { impl, calls } = fakeFetch(() => ({ json: { invitation: { id: "inv_1" } } }));
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", token: "t", fetchImpl: impl });
+    await api.cancelInvitation("inv_1");
+    expect(calls[0].url).toContain("/api/auth/organization/cancel-invitation");
+    expect(calls[0].body).toEqual({ invitationId: "inv_1" });
+  });
+
+  it("previewInvitation reads the public preview and surfaces a 404 as ApiError", async () => {
+    const preview = {
+      id: "inv_1",
+      email: "ada@team.com",
+      role: "member",
+      status: "pending",
+      organizationId: "org_1",
+      organizationName: "Team Vault",
+      inviterName: "Grace",
+    };
+    const ok = fakeFetch(() => ({ json: preview }));
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", fetchImpl: ok.impl });
+    expect(await api.previewInvitation("inv_1")).toEqual(preview);
+    expect(ok.calls[0].url).toBe("http://localhost:3010/api/invitations/inv_1/preview");
+
+    const missing = fakeFetch(() => ({ status: 404, json: { error: "not found" } }));
+    const api2 = new ApiClient({ baseUrl: "http://localhost:3010", fetchImpl: missing.impl });
+    await expect(api2.previewInvitation("inv_x")).rejects.toMatchObject({
+      name: "ApiError",
+      status: 404,
+    });
+  });
+
+  /**
+   * The invite inbox's whole bug: Better Auth's `list-user-invitations` answers
+   * 403 for any user whose email isn't verified — every password sign-up — so
+   * our own route has to be tried FIRST, and the legacy route only when the
+   * server is too old to have ours.
+   */
+  it("listUserInvitations prefers /api/invitations/mine", async () => {
+    const { impl, calls } = fakeFetch((call) => {
+      if (call.url.includes("/api/invitations/mine")) {
+        return { json: [{ id: "inv_1", email: "a@b.co", role: "member", status: "pending", organizationId: "org_1", organizationName: "Team" }] };
+      }
+      throw new Error(`unexpected call to ${call.url}`);
+    });
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", token: "t", fetchImpl: impl });
+    const invs = await api.listUserInvitations();
+    expect(invs).toHaveLength(1);
+    expect(invs[0].organizationName).toBe("Team");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("listUserInvitations falls back to the Better Auth route on a 404", async () => {
+    const { impl, calls } = fakeFetch((call) => {
+      if (call.url.includes("/api/invitations/mine")) {
+        return { status: 404, json: { error: "not found" } };
+      }
+      return { json: { invitations: [{ id: "inv_2", email: "a@b.co", role: "member", status: "pending", organizationId: "org_1" }] } };
+    });
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", token: "t", fetchImpl: impl });
+    const invs = await api.listUserInvitations();
+    expect(invs.map((i) => i.id)).toEqual(["inv_2"]);
+    expect(calls[1].url).toContain("/api/auth/organization/list-user-invitations");
+  });
+
+  it("listUserInvitations does NOT fall back on a non-404 failure", async () => {
+    // A 403 from our own route is a real failure. Retrying the legacy route
+    // would answer 403 for the same user and hide the problem as "no invites".
+    const { impl, calls } = fakeFetch(() => ({ status: 403, json: { error: "nope" } }));
+    const api = new ApiClient({ baseUrl: "http://localhost:3010", token: "t", fetchImpl: impl });
+    await expect(api.listUserInvitations()).rejects.toMatchObject({ status: 403 });
+    expect(calls).toHaveLength(1);
   });
 
   it("public links: create POSTs, get maps {link:null}, revoke DELETEs", async () => {
@@ -200,5 +320,120 @@ describe("ApiClient against a mocked fetch", () => {
     expect(calls[0].method).toBe("POST");
     expect(calls[0].body).toEqual({ name: "Ada Lovelace", image: "https://x/y.jpg" });
     expect(calls[0].headers.Authorization).toBe("Bearer t");
+  });
+});
+
+/**
+ * `health()` — the one probe in api.ts that must NOT fail closed (#91).
+ *
+ * The onboarding step validates a server URL before adopting it, and adopting
+ * one is a de-facto sign-out (the session lives under a per-server keychain
+ * key). So a wrong address has to come back as a wrong address: these cases pin
+ * that a 200 from something-that-isn't-us is a failure, and that "unreachable"
+ * stays distinguishable from "reachable but not Baalda" — the two send the user
+ * to completely different places.
+ */
+describe("ApiClient.health", () => {
+  /** A fetch returning one scripted raw response body. */
+  function rawFetch(status: number, body: string, capture?: { url?: string; auth?: string }) {
+    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (capture) {
+        capture.url = String(input);
+        capture.auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      }
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        headers: { get: () => null },
+        text: async () => body,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("resolves for a 2xx JSON body with ok:true, probing the given base", async () => {
+    const seen: { url?: string; auth?: string } = {};
+    const api = new ApiClient({
+      baseUrl: "http://localhost:3010",
+      token: "t",
+      fetchImpl: rawFetch(200, JSON.stringify({ ok: true }), seen),
+    });
+    await expect(api.health("https://notes.example.com/baalda/")).resolves.toBeUndefined();
+    // The candidate URL, not the client's current base — and no session token,
+    // because the point is to test the address.
+    expect(seen.url).toBe("https://notes.example.com/baalda/health");
+    expect(seen.auth).toBeUndefined();
+    // Probing must not repoint the client.
+    expect(api.getBaseUrl()).toBe("http://localhost:3010");
+  });
+
+  it("falls back to the client's own base when none is given", async () => {
+    const seen: { url?: string } = {};
+    const api = new ApiClient({
+      baseUrl: "http://localhost:3010",
+      fetchImpl: rawFetch(200, JSON.stringify({ ok: true }), seen),
+    });
+    await api.health();
+    expect(seen.url).toBe("http://localhost:3010/health");
+  });
+
+  it("rejects a 200 that isn't a Baalda health body", async () => {
+    for (const body of ["<!doctype html><h1>nginx</h1>", "", JSON.stringify({ ok: false }), '"ok"']) {
+      const api = new ApiClient({ fetchImpl: rawFetch(200, body) });
+      await expect(api.health("https://notes.example.com")).rejects.toMatchObject({
+        name: "ServerCheckError",
+        kind: "not-baalda",
+      });
+    }
+  });
+
+  it("calls a 404 the wrong app and a 500 an unreachable server", async () => {
+    const notUs = new ApiClient({ fetchImpl: rawFetch(404, "Not Found") });
+    await expect(notUs.health("https://notes.example.com")).rejects.toMatchObject({
+      kind: "not-baalda",
+    });
+
+    const down = new ApiClient({ fetchImpl: rawFetch(502, "Bad Gateway") });
+    await expect(down.health("https://notes.example.com")).rejects.toMatchObject({
+      kind: "unreachable",
+    });
+  });
+
+  it("reports a network failure or abort as unreachable, not as a crash", async () => {
+    const boom = (async () => {
+      throw new TypeError("Load failed");
+    }) as unknown as typeof fetch;
+    const api = new ApiClient({ fetchImpl: boom });
+    await expect(api.health("https://notes.example.com")).rejects.toMatchObject({
+      name: "ServerCheckError",
+      kind: "unreachable",
+    });
+
+    // What the AbortController's timeout looks like from here.
+    const aborted = (async () => {
+      throw Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+    }) as unknown as typeof fetch;
+    const api2 = new ApiClient({ fetchImpl: aborted });
+    await expect(api2.health("https://notes.example.com")).rejects.toMatchObject({
+      kind: "unreachable",
+    });
+  });
+
+  it("aborts the request when the server never answers", async () => {
+    // Never resolves on its own; only the signal ends it. Proves the Connect
+    // button can't spin forever against a host that accepts and then stalls.
+    const stalling = ((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      })) as unknown as typeof fetch;
+    vi.useFakeTimers();
+    try {
+      const api = new ApiClient({ fetchImpl: stalling });
+      const pending = api.health("https://notes.example.com");
+      const assertion = expect(pending).rejects.toMatchObject({ kind: "unreachable" });
+      await vi.advanceTimersByTimeAsync(HEALTH_TIMEOUT_MS + 1);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Webhook } from "standardwebhooks";
 import { createApp } from "../src/http/app.js";
-import { PolarBillingProvider } from "../src/billing/polar.js";
+import { PolarBillingProvider, verifyWebhookSignature } from "../src/billing/polar.js";
 import {
   canAddMember,
   canCreateOrganization,
@@ -9,17 +9,14 @@ import {
   getEntitlement,
   seatCount,
 } from "../src/billing/entitlements.js";
-import type {
-  BillingProvider,
-  NormalizedBillingEvent,
-} from "../src/billing/provider.js";
 import { testAppDeps } from "./helpers/app.js";
+import { makeFakeProvider, makeSnapshot } from "./helpers/billing-provider.js";
 import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
 import { resetDb } from "./helpers/db.js";
 import { createOrg, signUp } from "./helpers/auth.js";
 
-// The seat cap is a product decision that moves (3 → 10 when free vaults were
+// The seat cap is a product decision that moves (3 → 10 on 2026-08-07, back to 3 on 2026-09-09, when free vaults were
 // opened up to real teams). These suites assert that it is ENFORCED, so they
 // read the configured value rather than restating it — a test that has to be
 // edited every time the number changes tests the number, not the rule.
@@ -45,33 +42,9 @@ const WEBHOOK_SECRET = "test-polar-webhook-secret";
 
 // ── A controllable fake provider (no network). verifyAndNormalizeWebhook is
 //    scripted per-test via `fakeProvider.nextEvent`. Real signature checking is
-//    exercised separately with the actual PolarBillingProvider. ───────────────
-interface FakeProvider extends BillingProvider {
-  nextEvent: NormalizedBillingEvent | null;
-  lastCheckout: unknown;
-  canceled: string[];
-}
-function makeFakeProvider(): FakeProvider {
-  return {
-    nextEvent: null,
-    lastCheckout: null,
-    canceled: [],
-    async createCheckout(args) {
-      this.lastCheckout = args;
-      return { url: `https://polar.test/checkout/${args.interval}` };
-    },
-    async getPortalUrl(args) {
-      return { url: `https://polar.test/portal/${args.customerId}` };
-    },
-    async cancelSubscription(id) {
-      this.canceled.push(id);
-    },
-    verifyAndNormalizeWebhook() {
-      return this.nextEvent;
-    },
-  };
-}
-
+//    exercised separately with the actual PolarBillingProvider. It lives in
+//    tests/helpers so billing-lifecycle.test.ts shares exactly this fake and
+//    the two suites cannot drift. ─────────────────────────────────────────────
 const fakeProvider = makeFakeProvider();
 const app = createApp(testAppDeps({ billingProvider: fakeProvider }));
 const realApp = createApp(testAppDeps({ billingProvider: new PolarBillingProvider() }));
@@ -120,8 +93,7 @@ async function seedSubscription(
 describe("billing", () => {
   beforeEach(async () => {
     await resetDb();
-    fakeProvider.nextEvent = null;
-    fakeProvider.canceled = [];
+    fakeProvider.reset();
     process.env.POLAR_ACCESS_TOKEN = "test-polar-access-token"; // billing ON
   });
   afterEach(() => {
@@ -307,6 +279,11 @@ describe("billing", () => {
       expect(res.status).toBe(200);
       expect((await res.json()) as { url: string }).toEqual({ url: "https://polar.test/checkout/year" });
       expect((fakeProvider.lastCheckout as { interval: string }).interval).toBe("year");
+      // The success URL must carry Polar's checkout-id placeholder, or the
+      // success page has nothing to confirm the payment with.
+      expect((fakeProvider.lastCheckout as { successUrl: string }).successUrl).toBe(
+        `${config.betterAuthUrl}/api/billing/success?checkout_id={CHECKOUT_ID}`,
+      );
     });
 
     it("a plain member cannot start checkout (403)", async () => {
@@ -325,6 +302,39 @@ describe("billing", () => {
       expect(res.status).toBe(403);
     });
 
+    it("refuses a second checkout while the vault already pays (409)", async () => {
+      // One vault, one subscription: `subscriptions` is keyed by
+      // organization_id, so a second paid checkout would bill twice and the
+      // losing subscription would be invisible to us while Polar charged for
+      // it. The refusal must land BEFORE the provider is asked, so there is no
+      // checkout session for anyone to pay.
+      const owner = await signUp("co-dup@billing.com");
+      const org = await createOrg(owner, "Co3", "co-org3");
+
+      for (const status of ["active", "past_due"]) {
+        await seedSubscription(org.id, status, { subId: "sub_dup" });
+        const res = await req(app, "POST", `/api/billing/orgs/${org.id}/checkout`, {
+          token: owner.token,
+          body: { interval: "month" },
+        });
+        expect(res.status).toBe(409);
+        expect((await res.json()) as { error: string }).toEqual({
+          error: "already_subscribed",
+        });
+        expect(fakeProvider.lastCheckout).toBeNull();
+      }
+
+      // A row that is no longer paying is not a blocker — re-subscribing after
+      // a cancellation is the whole point of the Upgrade button still being there.
+      await seedSubscription(org.id, "canceled", { subId: "sub_dup" });
+      const again = await req(app, "POST", `/api/billing/orgs/${org.id}/checkout`, {
+        token: owner.token,
+        body: { interval: "month" },
+      });
+      expect(again.status).toBe(200);
+      expect(fakeProvider.lastCheckout).not.toBeNull();
+    });
+
     it("portal returns a URL when a customer exists, 400 otherwise", async () => {
       const owner = await signUp("po@billing.com");
       const org = await createOrg(owner, "Po", "po-org");
@@ -333,6 +343,111 @@ describe("billing", () => {
       const res = await req(app, "POST", `/api/billing/orgs/${org.id}/portal`, { token: owner.token });
       expect(res.status).toBe(200);
       expect((await res.json()) as { url: string }).toEqual({ url: "https://polar.test/portal/cus_po" });
+    });
+  });
+
+  // ── success page: confirm by checkout id, bounce into the app ──────────────
+  describe("success page", () => {
+    it("confirms a succeeded checkout with the provider and grants Pro before any webhook", async () => {
+      const owner = await signUp("succ@billing.com");
+      const org = await createOrg(owner, "Succ", "succ-org");
+      fakeProvider.checkouts.set("co_paid", {
+        status: "succeeded",
+        orgId: org.id,
+        userId: owner.userId,
+        providerSubscriptionId: "sub_paid",
+        providerCustomerId: "cus_paid",
+      });
+      // The subscription's own state is what gets written — the checkout only
+      // says which subscription to read.
+      fakeProvider.getResults.set(
+        "sub_paid",
+        makeSnapshot({ providerSubscriptionId: "sub_paid", providerCustomerId: "cus_paid" }),
+      );
+      const res = await req(app, "GET", "/api/billing/success?checkout_id=co_paid");
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // The hand-off names the vault so the app can refresh the right one.
+      expect(html).toContain(`baalda://billing/upgraded?org=${encodeURIComponent(org.id)}`);
+      expect(fakeProvider.checkoutsFetched).toEqual(["co_paid"]);
+      expect(fakeProvider.fetched).toEqual(["sub_paid"]);
+      // The row exists and is active — this is what the app's polling sees.
+      const billing = await req(app, "GET", `/api/billing/orgs/${org.id}`, { token: owner.token });
+      const body = (await billing.json()) as { plan: string; status: string };
+      expect(body.plan).toBe("pro");
+      expect(body.status).toBe("active");
+      const { rows } = await pool.query(
+        "SELECT provider_subscription_id, provider_customer_id FROM subscriptions WHERE organization_id = $1",
+        [org.id],
+      );
+      expect(rows[0].provider_subscription_id).toBe("sub_paid");
+      expect(rows[0].provider_customer_id).toBe("cus_paid");
+    });
+
+    it("writes nothing for a checkout that has not succeeded", async () => {
+      const owner = await signUp("open@billing.com");
+      const org = await createOrg(owner, "Open", "open-org");
+      fakeProvider.checkouts.set("co_open", {
+        status: "confirmed",
+        orgId: org.id,
+        userId: owner.userId,
+        providerSubscriptionId: null,
+        providerCustomerId: null,
+      });
+      const res = await req(app, "GET", "/api/billing/success?checkout_id=co_open");
+      expect(res.status).toBe(200);
+      // Still hands back to the app, still names the vault it was for.
+      expect(await res.text()).toContain(`baalda://billing/upgraded?org=${encodeURIComponent(org.id)}`);
+      expect(fakeProvider.fetched).toEqual([]);
+      const { rowCount } = await pool.query(
+        "SELECT 1 FROM subscriptions WHERE organization_id = $1",
+        [org.id],
+      );
+      expect(rowCount).toBe(0);
+    });
+
+    it("renders for an unknown, malformed or missing checkout id (never a dead end)", async () => {
+      for (const path of [
+        "/api/billing/success?checkout_id=co_nobody_knows",
+        "/api/billing/success?checkout_id=%3Cscript%3E",
+        "/api/billing/success",
+      ]) {
+        const res = await req(app, "GET", path);
+        expect(res.status).toBe(200);
+        const html = await res.text();
+        expect(html).toContain('href="baalda://billing/upgraded"');
+        expect(html).not.toContain("<script>alert");
+      }
+      // The malformed id was never sent to the provider.
+      expect(fakeProvider.checkoutsFetched).toEqual(["co_nobody_knows"]);
+    });
+
+    it("still renders when the provider is down", async () => {
+      fakeProvider.failGet = new Error("polar is down");
+      const res = await req(app, "GET", "/api/billing/success?checkout_id=co_whatever");
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("baalda://billing/upgraded");
+    });
+
+    it("a checkout for a vault deleted in the meantime lands as a tombstone", async () => {
+      const owner = await signUp("gone@billing.com");
+      fakeProvider.checkouts.set("co_gone", {
+        status: "succeeded",
+        orgId: "org-that-was-deleted",
+        userId: owner.userId,
+        providerSubscriptionId: "sub_gone",
+        providerCustomerId: "cus_gone",
+      });
+      const res = await req(app, "GET", "/api/billing/success?checkout_id=co_gone");
+      expect(res.status).toBe(200);
+      const { rows } = await pool.query(
+        "SELECT deleted_at, owner_user_id, status FROM subscriptions WHERE organization_id = $1",
+        ["org-that-was-deleted"],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].deleted_at).not.toBeNull();
+      expect(rows[0].owner_user_id).toBe(owner.userId);
+      expect(rows[0].status).toBe("active");
     });
   });
 
@@ -449,12 +564,75 @@ describe("billing", () => {
       expect(res.status).toBe(202);
     });
 
+    it("verifies BOTH Polar key derivations for a whsec_ secret (regression: 2026-09-08 prod 403s)", () => {
+      // Polar signs new endpoints the Standard-Webhooks way (strip `whsec_`,
+      // base64-decode) and old ones with base64(utf8(secret)). The SDK only
+      // knew the latter, so every real delivery to a new endpoint was 403'd.
+      const secret = "whsec_" + Buffer.from("0123456789abcdef0123456789abcdef").toString("base64");
+      const payload = JSON.stringify({ type: "product.created", data: { id: "p" } });
+      const at = new Date();
+      const sign = (wh: Webhook, id: string) => ({
+        "webhook-id": id,
+        "webhook-timestamp": String(Math.floor(at.getTime() / 1000)),
+        "webhook-signature": wh.sign(id, at, payload),
+      });
+      const standard = sign(new Webhook(secret), "msg_std");
+      const legacy = sign(new Webhook(Buffer.from(secret, "utf-8").toString("base64")), "msg_legacy");
+      expect(verifyWebhookSignature(payload, standard, secret)).toEqual(JSON.parse(payload));
+      expect(verifyWebhookSignature(payload, legacy, secret)).toEqual(JSON.parse(payload));
+      // Same headers, wrong secret → rejected under both derivations.
+      const other = "whsec_" + Buffer.from("ffffffffffffffffffffffffffffffff").toString("base64");
+      expect(() => verifyWebhookSignature(payload, standard, other)).toThrow(/signature/i);
+      expect(() => verifyWebhookSignature(payload, legacy, other)).toThrow(/signature/i);
+    });
+
+    it("upgrades the vault from a signed, Polar-shaped (snake_case) subscription.active event (real provider)", async () => {
+      const owner = await signUp("wire@billing.com");
+      const org = await createOrg(owner, "Wire", "wire-org");
+      const periodEnd = new Date(Date.now() + 30 * 86400_000).toISOString();
+      // Trimmed to the fields we read; Polar sends many more, which must not matter.
+      const payload = JSON.stringify({
+        type: "subscription.active",
+        timestamp: new Date().toISOString(),
+        data: {
+          id: "sub_wire",
+          created_at: new Date().toISOString(),
+          modified_at: null,
+          status: "active",
+          customer_id: "cus_wire",
+          current_period_end: periodEnd,
+          cancel_at_period_end: false,
+          metadata: { organization_id: org.id, user_id: owner.userId },
+        },
+      });
+      const { headers } = signWebhook(payload);
+      const res = await req(realApp, "POST", "/api/billing/webhook", {
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.parse(payload),
+      });
+      expect(res.status).toBe(200);
+      const ent = await getEntitlement(org.id);
+      expect(ent.active).toBe(true);
+      expect(ent.plan).toBe("pro");
+      const { rows } = await pool.query(
+        "SELECT provider_subscription_id, provider_customer_id, current_period_end FROM subscriptions WHERE organization_id = $1",
+        [org.id],
+      );
+      expect(rows[0].provider_subscription_id).toBe("sub_wire");
+      expect(rows[0].provider_customer_id).toBe("cus_wire");
+      expect(new Date(rows[0].current_period_end).toISOString()).toBe(periodEnd);
+    });
+
     it("upserts a subscription and is idempotent on replay (fake provider)", async () => {
       const owner = await signUp("wh@billing.com");
       const org = await createOrg(owner, "Wh", "wh-org");
 
       fakeProvider.nextEvent = {
         eventId: "evt_active_1",
+        userId: owner.userId,
+        interval: "month",
+        amount: 1000,
+        currency: "usd",
         occurredAt: new Date(),
         type: "subscription_active",
         organizationId: org.id,
@@ -486,6 +664,10 @@ describe("billing", () => {
 
       fakeProvider.nextEvent = {
         eventId: "evt_active_2",
+        userId: owner.userId,
+        interval: "month",
+        amount: 1000,
+        currency: "usd",
         occurredAt: new Date(Date.now() - 60_000),
         type: "subscription_active",
         organizationId: org.id,
@@ -501,6 +683,10 @@ describe("billing", () => {
 
       fakeProvider.nextEvent = {
         eventId: "evt_revoked_2",
+        userId: owner.userId,
+        interval: "month",
+        amount: 1000,
+        currency: "usd",
         occurredAt: new Date(),
         type: "subscription_revoked",
         organizationId: org.id,
@@ -528,6 +714,10 @@ describe("billing", () => {
       // Newer event lands first: subscription revoked at t1.
       fakeProvider.nextEvent = {
         eventId: "evt_revoked_3",
+        userId: owner.userId,
+        interval: "month",
+        amount: 1000,
+        currency: "usd",
         occurredAt: t1,
         type: "subscription_revoked",
         organizationId: org.id,
@@ -546,6 +736,10 @@ describe("billing", () => {
       // so the canceled org does NOT silently regain Pro.
       fakeProvider.nextEvent = {
         eventId: "evt_active_3_stale",
+        userId: owner.userId,
+        interval: "month",
+        amount: 1000,
+        currency: "usd",
         occurredAt: t0,
         type: "subscription_active",
         organizationId: org.id,
@@ -564,17 +758,42 @@ describe("billing", () => {
     });
   });
 
-  // ── org delete cancels the subscription (best-effort) ───────────────────────
-  it("DELETE /api/orgs/:orgId cancels the provider subscription", async () => {
+  // ── org delete stops billing and leaves a tombstone (#109/#111) ────────────
+  //    The old contract was the opposite of this: cancel best-effort, then let
+  //    the FK cascade wipe the row. See tests/billing-lifecycle.test.ts for the
+  //    provider-refuses, already-canceling and free-vault variants.
+  it("DELETE /api/orgs/:orgId cancels at period end and keeps a tombstone", async () => {
     const owner = await signUp("del@billing.com");
     const org = await createOrg(owner, "Del", "del-org");
     await seedSubscription(org.id, "active", { subId: "sub_del" });
     const res = await req(app, "DELETE", `/api/orgs/${org.id}`, { token: owner.token });
     expect(res.status).toBe(200);
-    expect(fakeProvider.canceled).toContain("sub_del");
-    // FK cascade removed the subscriptions row.
-    const { rows } = await pool.query("SELECT 1 FROM subscriptions WHERE organization_id = $1", [org.id]);
-    expect(rows.length).toBe(0);
+    const body = (await res.json()) as {
+      subscription: { cancelAtPeriodEnd: boolean } | null;
+    };
+    // Period end, not revoke: the owner already paid for this month.
+    expect(fakeProvider.canceled).toEqual([{ id: "sub_del", mode: "period_end" }]);
+    expect(body.subscription?.cancelAtPeriodEnd).toBe(true);
+    // The row SURVIVES so the owner can still see, cancel or transfer it.
+    const { rows } = await pool.query<{
+      deleted_at: Date | null;
+      owner_user_id: string | null;
+      cancel_at_period_end: boolean;
+    }>(
+      `SELECT deleted_at, owner_user_id, cancel_at_period_end
+         FROM subscriptions WHERE organization_id = $1`,
+      [org.id],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].deleted_at).not.toBeNull();
+    expect(rows[0].owner_user_id).toBe(owner.userId);
+    expect(rows[0].cancel_at_period_end).toBe(true);
+    // And the vault itself really is gone.
+    const { rows: orgRows } = await pool.query(
+      "SELECT 1 FROM organization WHERE id = $1",
+      [org.id],
+    );
+    expect(orgRows.length).toBe(0);
   });
 });
 

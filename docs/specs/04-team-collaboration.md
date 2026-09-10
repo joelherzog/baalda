@@ -50,7 +50,8 @@ invitation   (id, organization_id, email, role, inviter_id,
 ```
 
 Roles for MVP — keep exactly three (matches Notion/Outline/Docmost): **owner** (billing, delete/
-transfer the vault), **admin** (manage members, invitations, settings), **member** (basic access).
+transfer the vault, and transfer the subscription between vaults they own), **admin** (manage
+members, invitations, settings), **member** (basic access).
 
 ## 3. Sharing & permissions
 
@@ -208,7 +209,11 @@ follow-mode, cursor chat.
 Two steps (Better Auth invitation flow + our `shares`):
 
 **A. Into the vault:** admin invites by email → `invitation` row (`pending`, `+48h`) → email
-with a signed accept link → invitee signs up / logs in / accepts → `member` row with the invited role.
+with a link to `/invite/<id>` (a server-rendered page that bounces into the app's
+`baalda://invite/<id>?server=` deep link) → invitee signs up / logs in with the invited address /
+accepts → `member` row with the invited role. Email is opt-in per server (`EMAIL_FROM` + a transport);
+without it the admin copies the same link from Members. Redeeming the vault's **join code** while an
+invitation is pending consumes it (same role, marked accepted) so both doors lead to one state.
 
 **B. Into a specific folder:** on "Share folder → add person," create a `shares` row
 (`resource_type='folder'`, `permission='view'|'edit'`). If the invitee isn't a member yet, create the

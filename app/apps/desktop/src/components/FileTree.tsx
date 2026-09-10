@@ -1,5 +1,7 @@
 import {
   createContext,
+  lazy,
+  Suspense,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -29,6 +31,7 @@ import {
   renameInOrder,
 } from "../lib/ordering";
 import { pinModified, sortTree, TREE_SORTS } from "../lib/tree/sort";
+import { isBlankTreeTarget } from "../lib/tree/blankTarget";
 import { LOCK_TITLES, lockScopesByPath, type LockScope } from "../lib/locks";
 import { previewKind } from "../lib/preview";
 import {
@@ -56,8 +59,14 @@ import {
   ringShowsColor,
   statusTone,
 } from "../lib/presence/color";
-import { characterSvg } from "./Identity";
-import { ShareDialog, type ShareTarget } from "./ShareDialog";
+import { Face } from "./Face";
+import type { ShareTarget } from "./ShareDialog";
+
+/* Lazy: the sharing sheet is a context-menu action, and keeping it out of the
+   eager graph is also what lets it static-import the avatar chunk. */
+const ShareDialog = lazy(() =>
+  import("./ShareDialog").then((m) => ({ default: m.ShareDialog })),
+);
 import { placeMenu, type Placement } from "../lib/menuPlacement";
 
 /** Tooltip on every root-create affordance while the vault's root is frozen. */
@@ -223,7 +232,12 @@ export function FileTree() {
   const [menuPos, setMenuPos] = useState<Placement | null>(null);
   const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null);
   // Which way the fold toggle points: false → "collapse all", true → "expand all".
-  const [treeCollapsed, setTreeCollapsed] = useState(false);
+  // Folders start closed (`openByDefault={false}` on the Tree), so the toggle
+  // starts out offering "expand". Kept in step with the real tree on every
+  // click and fold, so it never takes a dead click to get in sync.
+  const [treeCollapsed, setTreeCollapsed] = useState(true);
+  const anyFolderOpen = () =>
+    treeRef.current?.visibleNodes.some((n) => n.isInternal && n.isOpen) ?? false;
   // The sort popover under the toolbar's sort button.
   const [sortOpen, setSortOpen] = useState(false);
   // True while an OS drag hovers the tree, for the drop-target highlight.
@@ -406,6 +420,8 @@ export function FileTree() {
     if (node?.isDir && node.childrenLoaded !== true) {
       void useStore.getState().loadChildren(id);
     }
+    // Arborist applies the fold after this callback; read it next frame.
+    requestAnimationFrame(() => setTreeCollapsed(!anyFolderOpen()));
   };
 
   function toggleSelect(path: string) {
@@ -520,6 +536,25 @@ export function FileTree() {
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, []);
+
+  /**
+   * Open the context menu scoped to the vault ROOT, from a right-click on the
+   * tree's blank space.
+   *
+   * A null node is the whole of what makes it a root menu: every node-specific
+   * item is already gated on `menu.node`, and `menuDir` already falls back to
+   * `""` (the vault root) without one — which also means the frozen-root
+   * refusal (`menuCreateBlocked`) applies here for free.
+   *
+   * The sort popover closes first for the same reason its own opener closes
+   * this menu: the two are separate floating layers and only one should be up.
+   * Re-opening while a menu is already showing is just another `setMenu`, so
+   * the placement effect re-measures at the new cursor.
+   */
+  function openRootMenu(x: number, y: number) {
+    setSortOpen(false);
+    setMenu({ x, y, node: null });
+  }
 
   // Measure the menu, then decide where it actually goes. This has to be a
   // LAYOUT effect: it runs (and the re-render it schedules runs) before the
@@ -759,6 +794,28 @@ export function FileTree() {
       await ipc.revealInFileManager(`${root}/${node.data.path}`);
     } catch (e) {
       console.error("reveal failed", e);
+      toast("Couldn't open that in the file manager", "error");
+    }
+  }
+
+  /**
+   * Open the vault's own folder — the root menu's counterpart to `revealNode`,
+   * and the same thing the sidebar header's button does.
+   *
+   * `openInFileManager`, deliberately not `revealInFileManager`: opening the
+   * vault means stepping INSIDE the folder to see the notes, where revealing
+   * would select it in its parent. The two helpers have mirrored fallback
+   * orders for that reason (see `lib/ipc.ts`), and this one's fallback is what
+   * covers a vault living on an external volume.
+   */
+  async function openVaultRoot() {
+    setMenu(null);
+    const root = useStore.getState().vault?.path;
+    if (!root) return;
+    try {
+      await ipc.openInFileManager(root);
+    } catch (e) {
+      console.error("open vault failed", e);
       toast("Couldn't open that in the file manager", "error");
     }
   }
@@ -1321,6 +1378,21 @@ export function FileTree() {
       // toolbar, must not thaw the order and re-sort mid-aim.
       onPointerEnter={() => setPointerInTree(true)}
       onPointerLeave={() => setPointerInTree(false)}
+      // Right-click on blank space gets the vault-root menu. On the CONTAINER,
+      // not the scroll area: with an empty vault there is no `<Tree>` at all,
+      // only `.filetree-empty`, and that is exactly the case where "New note"
+      // needs to be reachable.
+      //
+      // Rows also `stopPropagation` in their own `onContextMenu`, so this can
+      // never double-fire for one — but that coupling is implicit, so
+      // `isBlankTreeTarget` re-states the rule in a form that survives the
+      // stopPropagation call being removed. `contextmenu` is not `click`, so
+      // the window-level dismiss above does not fire alongside it.
+      onContextMenu={(e) => {
+        if (!isBlankTreeTarget(e.target as Element | null)) return;
+        e.preventDefault();
+        openRootMenu(e.clientX, e.clientY);
+      }}
     >
       <div className="filetree-head">
         <span className="section-label">Notes</span>
@@ -1359,9 +1431,13 @@ export function FileTree() {
               treeCollapsed ? "Expand all folders" : "Collapse all folders"
             }
             onClick={() => {
-              if (treeCollapsed) treeRef.current?.openAll();
-              else treeRef.current?.closeAll();
-              setTreeCollapsed(!treeCollapsed);
+              // Decide from the tree, not from our flag: if anything is open,
+              // collapse; otherwise expand. A flag that drifted from the tree
+              // is what made the first click do nothing.
+              const open = anyFolderOpen();
+              if (open) treeRef.current?.closeAll();
+              else treeRef.current?.openAll();
+              setTreeCollapsed(open);
             }}
           >
             <span className="fold-icon fold-collapse" aria-hidden="true">
@@ -1621,6 +1697,13 @@ export function FileTree() {
           >
             Import folder…
           </li>
+          {/* Root menu only, and it sits where a row's reveal item sits, so the
+              "get me to this on disk" action is always in the same place. */}
+          {!menu.node && (
+            <li className="menu-sep-item" onClick={() => void openVaultRoot()}>
+              {ipc.openVaultLabel()}
+            </li>
+          )}
           {menu.node && (
             <li onClick={() => void exportNode(menu.node!)}>Export…</li>
           )}
@@ -1720,10 +1803,12 @@ export function FileTree() {
       )}
 
       {shareTarget && (
-        <ShareDialog
-          target={shareTarget}
-          onClose={() => setShareTarget(null)}
-        />
+        <Suspense fallback={null}>
+          <ShareDialog
+            target={shareTarget}
+            onClose={() => setShareTarget(null)}
+          />
+        </Suspense>
       )}
     </div>
   );
@@ -1971,14 +2056,11 @@ function TreeSyncMark({
 /** One presence face: the teammate's illustrated character ringed in their
  *  colour — the same treatment as the editor's PresenceAvatar, sized for a row. */
 function SidebarAvatar({ peer }: { peer: VaultPeer }) {
-  const svg = useMemo(
-    () => characterSvg(peer.name || peer.userId || "?"),
-    [peer.name, peer.userId],
-  );
   const tone = statusTone(peer.status);
   const live = ringShowsColor(tone);
   return (
-    <span
+    <Face
+      seed={peer.name || peer.userId || "?"}
       className={`tree-presence-avatar tone-${tone}${live ? "" : " offline"}`}
       style={
         {
@@ -1986,7 +2068,6 @@ function SidebarAvatar({ peer }: { peer: VaultPeer }) {
         } as CSSProperties
       }
       title={peer.name}
-      dangerouslySetInnerHTML={{ __html: svg }}
     />
   );
 }
@@ -2017,6 +2098,13 @@ function SidebarPresence({ peers }: { peers: VaultPeer[] }) {
     </span>
   );
 }
+
+/** Second click on the same row within this window = rename. Fixed rather than
+ *  the OS double-click interval; see the row's onClick. Very tight on purpose:
+ *  only a snappy, deliberate double-click gets in, while opening a folder and
+ *  closing it again "fast" is a pair of separate clicks that must NOT rename. */
+const RENAME_DOUBLE_CLICK_MS = 180;
+let lastRowClick: { path: string; at: number } | null = null;
 
 function Node({
   node,
@@ -2092,14 +2180,25 @@ function Node({
       }}
       onClick={() => {
         if (isDir) node.toggle();
-      }}
-      onDoubleClick={(e) => {
-        // Double-click a row to rename it in place (Finder-style). Stop the
-        // event so a folder's toggle doesn't fight the rename that follows.
-        // Disabled while selecting — a double-click there is just two picks.
-        if (selectMode) return;
-        e.stopPropagation();
-        node.edit();
+        // Double-click a row to rename it in place (Finder-style) — but timed
+        // by us, not by the browser's `dblclick`. That event honours the OS
+        // "double-click speed" setting, which on a slow setting pairs two
+        // clicks more than a second apart, so re-clicking a note you already
+        // had open kept dropping people into rename. Two clicks on the SAME
+        // row inside a fixed short window, nothing else. Disabled while
+        // selecting — a double-click there is just two picks.
+        const now = performance.now();
+        const prev = lastRowClick;
+        lastRowClick = { path: node.data.path, at: now };
+        if (
+          !selectMode &&
+          prev &&
+          prev.path === node.data.path &&
+          now - prev.at < RENAME_DOUBLE_CLICK_MS
+        ) {
+          lastRowClick = null;
+          node.edit();
+        }
       }}
     >
       {selectMode && (

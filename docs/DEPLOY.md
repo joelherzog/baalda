@@ -112,30 +112,52 @@ Generate a real `JWT_SECRET` for anything beyond local testing:
 
 ## Option B: Railway
 
-The repo ships a checked-in `railway.json` at the repo root, so Railway needs
-almost no manual configuration:
+The server's Railway settings are checked in as Infrastructure as Code at
+`app/.railway/railway.ts` — Dockerfile build, pre-deploy migration, `/health`
+check, restart policy and a 1 GiB memory cap — so Railway needs almost no manual
+configuration:
 
-1. Create a new Railway project and deploy from this repo. Railway
-   reads `railway.json` and builds `app/apps/server/Dockerfile` with the repo
-   root as build context.
-2. Add a **Postgres** database service to the project (Railway's own Postgres
-   plugin works fine).
-3. On the server service, set the environment variables:
+1. Create a new Railway project, add a **Postgres** database service, and add a
+   service that deploys this repo from GitHub.
+2. On the server service, set the environment variables:
    - `DATABASE_URL`: reference the Postgres service's connection string
      (Railway lets you wire this as a variable reference instead of copying
      a literal value).
    - `JWT_SECRET`: generate one with `openssl rand -base64 32`.
    - `BETTER_AUTH_URL`: the server's public HTTPS URL (Railway gives you a
      `*.up.railway.app` domain, or attach your own).
-4. Deploy. `railway.json`'s `deploy.preDeployCommand` runs
-   `node dist/db/migrate.js` before every deploy, and `deploy.healthcheckPath`
-   is `/health`, so Railway won't cut over traffic until migrations have run
-   and the server is answering.
+3. Apply the checked-in settings from a clone. Needs the Railway CLI 5.42 or
+   newer and a `pnpm install` in `app/` (which brings the `railway` SDK):
+
+   ```bash
+   cd app
+   railway link            # choose the project, its environment and the server service
+   railway config plan     # preview — only that service's build/deploy settings change
+   railway config apply
+   ```
+
+   The file is scoped to the server service (`export const partial`), keeps every
+   variable the service already has (`preserve()`) and never touches Postgres,
+   volumes or domains. It pins the GitHub source to `naveedharri/baalda` (a
+   project whose name contains "staging" deploys the `staging` branch, anything
+   else `main`); a fork changes that one string. The settings then live on the
+   service, so this is only re-run when the file changes.
+4. Deploy (`apply` triggers one). `preDeployCommand` runs `node dist/db/migrate.js`
+   before every deploy and the health check is `/health`, so Railway won't cut
+   over traffic until migrations have run and the server is answering.
 5. Expose only the one HTTP port (Railway does this automatically from
    `PORT`); nothing else needs to be public.
 
-Point the desktop app at the deployed server via the server URL field in
-Settings.
+> **`railway.json` is legacy.** The repo-root `railway.json` is Railway's older
+> "Config as Code" form of the same settings. Only services created before
+> mid-2026 still read it, and Railway stops reading it everywhere on 2026-12-01;
+> a newer service that has nothing but `railway.json` builds with Railpack, runs
+> no migrations, and answers every sign-in with HTTP 500 (`relation "user" does
+> not exist`). Keep the two files in step until `railway.json` is removed.
+
+Then point the desktop app at it — see
+[Point the desktop app at your server](#point-the-desktop-app-at-your-server)
+for the first-run step, Settings → Connection, and the invite link.
 
 ### Option B (one-click)
 
@@ -171,14 +193,16 @@ note on every instance deployed from it. Nothing else is set: billing stays off
 (so there are **no** vault or member limits), Google sign-in stays hidden until
 you add OAuth credentials, and Redis is only needed to run several instances.
 
-Once it's up, put the generated `*.up.railway.app` URL into the desktop app's
-Server settings and create an account.
+Once it's up, open the desktop app: its first-run step asks whether your notes
+live on the managed service or **your own server**, and the generated
+`*.up.railway.app` URL goes there. You can also send your team
+`https://<that URL>/open/connect` and let them click it.
 
 ### Maintaining the template
 
 The service config lives in Railway's template editor, **not** in this repo — the
-only parts version-controlled here are `railway.json` (builder, pre-deploy
-migration, healthcheck) and the Dockerfile. Changing the required env vars means
+only parts version-controlled here are `app/.railway/railway.ts` (builder,
+pre-deploy migration, healthcheck) and the Dockerfile. Changing the required env vars means
 editing the template in the dashboard too, or one-click deploys will boot
 misconfigured.
 
@@ -203,6 +227,37 @@ curl -sL https://railway.com/deploy/baalda-server | grep -o '<title>[^<]*</title
 > and publishing it would push a public marketplace template built from production
 > — env values, domain and all. Always compose the template fresh, as above.
 
+## A staging instance
+
+Nothing in the server distinguishes staging from production — a staging instance
+is just **a second deployment of this same server with its own database**, set up
+exactly as above. Give it its own `DATABASE_URL`, its own `JWT_SECRET` (sharing
+one would let a token minted on either instance authenticate on the other) and a
+`BETTER_AUTH_URL` matching its own public URL.
+
+The desktop side picks it up at **build** time rather than at runtime. The
+frontend's `DEFAULT_SERVER_URL` (`app/apps/desktop/src/lib/api.ts`) honours a
+`VITE_SERVER_URL` inlined by Vite, and `.github/workflows/staging-release.yml`
+sets that from a repo Actions variable named `STAGING_SERVER_URL`, so the
+**Baalda Staging** app it publishes defaults to your staging instance with nothing
+for the tester to configure. See `docs/RELEASE.md` → *Staging*.
+
+Two consequences worth stating plainly:
+
+- **A published staging build reveals its server URL.** Vite inlines the value
+  into the JS bundle and the installer is a public prerelease asset, so anyone who
+  downloads it can read the URL out. A staging instance is internet-facing and
+  needs the same auth posture as a production one — it is not protected by being
+  hard to find.
+- **Vaults do not move between instances.** A vault's `.context/config.json`
+  binds that folder to one server's vault id and doc-id map, so a folder used
+  against staging must not also be opened against production. Use separate
+  folders, not separate accounts.
+
+Migrations are idempotent and tracked in `_migrations`, so a staging instance is
+also the natural place to run a new migration first: deploy the branch there,
+confirm `/health` and a real sync round-trip, then promote.
+
 ## Environment variables
 
 | Variable | Required | Default | Notes |
@@ -226,13 +281,128 @@ curl -sL https://railway.com/deploy/baalda-server | grep -o '<title>[^<]*</title
 | `POLAR_PRODUCT_YEARLY_ID` | with billing | unset | Polar product id for the yearly plan. |
 | `POLAR_SERVER` | no | `sandbox` | `sandbox` or `production` Polar environment. |
 | `FREE_MAX_VAULTS` | no | `3` | Free-tier cap on unsubscribed vaults per user (only enforced when billing is enabled). |
-| `FREE_MAX_MEMBERS` | no | `10` | Free-tier cap on members + pending invitations per unsubscribed vault (only enforced when billing is enabled). |
+| `FREE_MAX_MEMBERS` | no | `3` | Free-tier cap on members + pending invitations per unsubscribed vault (only enforced when billing is enabled). Gates new invitations and join-code redemptions only; lowering it never removes existing members. |
+| `DEEP_LINK_SCHEME` | no | `baalda` | URL scheme of the desktop app the server's pages bounce into. Set `baalda-staging` on the server behind the Staging app so production and staging links open the right app on a machine that has both. |
+| `EMAIL_FROM` | for email | unset | **Outbound email (optional).** Sender address, e.g. `Baalda <no-reply@example.com>`. With this and ONE transport below, password reset ("Forgot password?"), sign-up verification and invitation emails switch on. Unset ⇒ email off and none of those is offered (invitations are shared as a link instead). |
+| `SMTP_URL` | one transport | unset | Any SMTP server: `smtp://user:pass@host:587` (STARTTLS) or `smtps://user:pass@host:465` (TLS). |
+| `RESEND_API_KEY` | one transport | unset | [Resend](https://resend.com) API key — the HTTPS alternative to SMTP. |
+| `EMAIL_TRANSPORT` | no | inferred | Force `smtp` \| `resend` \| `log` \| `memory` instead of inferring from the credential set. `log` prints emails to stdout (local dev); `memory` is the test suite's; both are refused in production. |
 
 > Billing note: the Polar organization must have **allow multiple subscriptions per customer** enabled
 > (Organization settings, or `PATCH /v1/organizations/:id` with `subscription_settings.allow_multiple_subscriptions: true`),
 > otherwise a customer's second vault upgrade is rejected at checkout.
 
+Billing needs no manual cleanup, and in particular none after a vault is deleted.
+`DELETE /api/orgs/:orgId` asks the provider to cancel at the **end of the current
+period** *before* it deletes anything: if the provider refuses, the vault is kept
+and the route answers `502 subscription_cancel_failed`. The `subscriptions` row
+then outlives the vault as a **tombstone** (migration 024 dropped the cascade
+from `organization` and added `deleted_at` / `org_name` / `owner_user_id`), so a
+late `subscription.*` webhook is stored and acknowledged instead of failing on a
+foreign key and being retried by the provider forever. Webhooks resolve their row
+by provider subscription id first, which is also what makes a transferred
+subscription land on the vault that now holds it. Tombstones are what the owner
+sees under "From deleted vaults", and `GET /api/billing/mine` re-reads stale
+active rows from the provider, so our Postgres and the provider converge on their
+own — never edit `subscriptions` by hand to fix a mismatch.
+
 See `app/apps/server/.env.example` for the same list with inline comments.
+
+## Outbound email (password reset, invitations)
+
+Email is opt-in, on the same pattern as Google sign-in: leave it unconfigured
+and the server never tries to send anything — the desktop hides "Forgot
+password?", `POST /api/auth/request-password-reset` answers 400, and Members
+offers **Copy link** on each invitation so an admin can paste it into chat.
+Configure `EMAIL_FROM` plus either `SMTP_URL` or `RESEND_API_KEY` and three
+things switch on together:
+
+- **Password reset** — "Forgot password?" in the app (and on `/oauth/login`)
+  emails a single-use link, valid for one hour, to `<BETTER_AUTH_URL>/reset-password`,
+  a page this server renders itself; setting the password there bounces back
+  into the app's sign-in card. Setting a new password signs out every other
+  session. The request reports what happened — sent, no account for that
+  address on this server, or the provider's error — rather than a neutral
+  "check your inbox" (sign-up already reveals whether an address is taken, so
+  the neutral answer protected nothing and hid wrong-server mistakes).
+  An account created through Google has no password; the same flow lets it set one.
+- **Sign-up verification** — a confirmation email on sign-up, recorded when the
+  link is clicked; the confirmation page bounces back into the app, which shows
+  the verified state under Account settings → Email without a reload (and offers
+  a resend). It does not gate sign-in yet (accounts created before this shipped
+  were never verified, and locking them out would be worse than the problem it
+  solves).
+- **Invitation emails** — inviting a teammate emails them a link to
+  `<BETTER_AUTH_URL>/invite/<id>`, which opens the desktop app on that
+  invitation: sign in (or sign up) with the invited address and they land in the
+  vault. Members says "Invitation emailed" only once the provider accepted the
+  message; if it refused, the reason is shown with the link to share instead.
+  Inviting an address that is already pending re-sends. A teammate who was
+  invited by email but joins with the vault's **join code** ends up in the same
+  state — the invited role, invitation marked accepted.
+
+Links are built from `BETTER_AUTH_URL`, so it must be the address people can
+reach from outside. A half-configured setup (a transport without `EMAIL_FROM`,
+or the other way round) is a startup error on purpose: offering reset links
+that never arrive is worse than offering none.
+
+**No email and someone is locked out?** From the server's shell, with the
+server's environment (`DATABASE_URL`):
+
+```bash
+cd app/apps/server
+pnpm run set-password -- someone@example.com                # prints a generated password
+pnpm run set-password -- someone@example.com --password '…'  # or set a chosen one
+```
+
+It writes a fresh argon2id hash (creating the credential for a Google-only
+account) and revokes the account's live sessions. In Docker, run the compiled
+copy inside the container: `docker exec -it <container> node dist/scripts/set-password.js someone@example.com`.
+
+## Point the desktop app at your server
+
+An account belongs to **one server**. A teammate who signs up on the managed
+instance by mistake gets an account and a vault there, and nobody notices until
+you cannot see them in Members — so the app asks which server before it takes a
+password.
+
+**On first run**, the sign-in dialog opens on *"Where do your notes live?"* with
+two options: the managed service, or **Your own server**. Choosing your own asks
+for the URL and checks `GET <url>/health` before it goes any further, so a typo
+is one inline sentence instead of a `Load failed` three screens later. The
+sign-in form that follows names the server it is about to post to, with a
+**Change** link back.
+
+**Later**, or on a device already signed in somewhere else: **Account settings →
+Connection**. Same health check, same rules. Changing the server is a de-facto
+sign-out — sessions are stored per server in the OS keychain — so the app lands
+on that server's session, or signed out if it has none.
+
+**Send one link instead of dictating a URL.** Your server serves
+
+```
+https://<your-server>/open/connect
+```
+
+which is clickable in chat (a bare `baalda://` scheme is not) and bounces into
+the app, where it asks the person to confirm before connecting. Nothing is
+applied without that click: the link decides where a password gets posted, so it
+is treated as untrusted input. Behind a reverse proxy with a path prefix, send
+`https://<your-server>/<prefix>/open/connect` and have the proxy set
+`X-Forwarded-Prefix` — that header is the only way the server can learn the
+prefix, since a prefix left on the forwarded path does not match the route.
+
+The page derives the address from the incoming request, honouring
+`X-Forwarded-Proto` and `X-Forwarded-Host`, and falls back to `BETTER_AUTH_URL`
+— so set that correctly (see the table above) if your proxy does not forward a
+usable `Host`.
+
+> **URLs accepted:** a bare host gets `https://` (never http, which would send
+> credentials in the clear); an explicit `http://` is honoured for a LAN or
+> localhost server; a path prefix is kept. **Packaged builds can only reach
+> plain `http://` on `localhost` / `127.0.0.1`** — the webview's
+> `connect-src` allows all `https:` but only loopback for `http:`, so a LAN
+> server at `http://192.168.x.x:3010` needs TLS or an SSH tunnel.
 
 ## Scaling & high availability (spec 05)
 

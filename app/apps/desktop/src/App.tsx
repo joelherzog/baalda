@@ -1,26 +1,26 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import "./App.css";
-import { AccountMenu, AuthDialog } from "./components/AccountMenu";
+import { AccountMenu } from "./components/AccountMenu";
 import { AsyncButton } from "./components/AsyncButton";
 import { TalkButton } from "./components/TalkButton";
 import { BacklinksPanel } from "./components/BacklinksPanel";
-import { Editor } from "./components/Editor";
+import { EditorEmpty, EditorSkeleton } from "./components/EditorPlaceholders";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FileTree } from "./components/FileTree";
-import { GraphView } from "./components/GraphView";
 import { SyncBadge } from "./components/Identity";
 import { SearchPanel } from "./components/SearchPanel";
 import { SidebarHeader } from "./components/SidebarHeader";
+import { Spinner } from "./components/Spinner";
 import { SidebarResizer } from "./components/SidebarResizer";
 import { TabBar } from "./components/TabBar";
 import { Toasts } from "./components/Toasts";
 import { toast } from "./lib/toast";
-import { VaultPicker } from "./components/VaultPicker";
 import { VersionPanel } from "./components/VersionPanel";
 import { bridgeManager } from "./lib/bridge";
 import { BRAND_NAME } from "./lib/brand";
 import * as ipc from "./lib/ipc";
+import * as perf from "./lib/perf";
 import { implicatedFolders } from "./lib/tree/lazyTree";
 import { syncManager } from "./lib/sync/docSession";
 import {
@@ -40,6 +40,24 @@ import { listenForNoteLinks } from "./lib/deepLink";
 import { useSidebarWidth } from "./lib/useSidebarWidth";
 import { requestOpenVault, useStore } from "./store";
 import { clearPendingNoteLink } from "./lib/noteLinkFlow";
+import { prefetchAfterPaint } from "./lib/prefetch";
+import { revealWindowOnce } from "./lib/windowReveal";
+
+/* Lazy chunks. Each of these is either a rare deliberate action (the graph),
+   a modal (settings, auth), or big enough that the first paint should not wait
+   on it (the editor carries CodeMirror + lezer). `lib/prefetch.ts` warms the
+   editor right after the first paint, so the first note click is still
+   instant. */
+const Editor = lazy(() => import("./components/Editor").then((m) => ({ default: m.Editor })));
+const GraphView = lazy(() =>
+  import("./components/GraphView").then((m) => ({ default: m.GraphView })),
+);
+const VaultPicker = lazy(() =>
+  import("./components/VaultPicker").then((m) => ({ default: m.VaultPicker })),
+);
+const AuthDialog = lazy(() =>
+  import("./components/AuthDialog").then((m) => ({ default: m.AuthDialog })),
+);
 
 /** How often a running app re-checks for a new release (it also checks at
  *  launch). The check is one cheap GET of the release's static `latest.json`
@@ -92,13 +110,27 @@ function Banner({
   );
 }
 
+/**
+ * The file behind the open note vanished from disk (Finder, `rm`, a script, an
+ * AI tidying the vault).
+ *
+ * In a synced vault that is now a real delete: the sync layer keeps a recovery
+ * copy in `.context/trash/` and removes the note for the team, exactly like the
+ * sidebar's Delete (see `SyncManager.drainDiskDeletes`). The banner says so
+ * rather than implying the app lost track of the file — and it still only offers
+ * to close, because the editor may hold text the user has not saved anywhere.
+ */
 function RemovedBanner() {
   const noteRemoved = useStore((s) => s.noteRemoved);
   const openNote = useStore((s) => s.openNote);
+  // Latched when the file vanished, not read live: propagating the delete drops
+  // the note's mapping, which would otherwise re-word the banner mid-sentence.
+  const synced = useStore((s) => s.noteRemovedSynced);
   return (
     <Banner show={!!noteRemoved && !!openNote}>
       <span>
-        <strong>{openNote?.title}</strong> was deleted on disk.
+        <strong>{openNote?.title}</strong> was deleted on disk
+        {synced ? " and removed for the team. A copy is kept in the vault's trash." : "."}
       </span>
       <div className="banner-actions">
         <button
@@ -127,11 +159,17 @@ function RemovedBanner() {
  * where the local copy went, which is the difference between a scare and a note.
  */
 function DeletedByTeammateBanner() {
-  const trashedTo = useStore((s) => s.noteRemovedByTeammate);
+  const removed = useStore((s) => s.noteRemovedByTeammate);
   return (
-    <Banner show={!!trashedTo}>
+    <Banner show={!!removed}>
       <span>
-        A teammate deleted this note. Your copy was moved to <code>{trashedTo}</code>.
+        {removed?.reason === "revoked" ? (
+          <>Your access to this note was removed. It is no longer on this device.</>
+        ) : (
+          <>
+            A teammate deleted this note. Your copy was moved to <code>{removed?.trashedTo}</code>.
+          </>
+        )}
       </span>
       <div className="banner-actions">
         <button
@@ -184,6 +222,40 @@ function MemberJoinedBanner() {
 }
 
 /**
+ * App-wide "switching vault" overlay. A switch is many round trips (activate
+ * org → session → roster → open the folder → re-enable sync → reconcile), and
+ * for that stretch the window is a mix of the vault you left and the one you're
+ * going to. Rather than a spinner in one corner, cover the whole app with a
+ * calm card that names the destination, so nothing half-updated can be read or
+ * clicked in the meantime. Sits above every modal (Settings is where most
+ * switches start) and below only the update wall.
+ *
+ * Fades in after a short delay (CSS) so a near-instant local switch never
+ * flashes it.
+ */
+function VaultSwitchOverlay() {
+  const switching = useStore((s) => s.switchingVault);
+  if (!switching) return null;
+  return (
+    <div className="vault-switch-overlay" role="status" aria-live="polite">
+      <div className="vault-switch-card">
+        <Spinner size="md" tone="accent" />
+        <div className="vault-switch-text">
+          <span className="vault-switch-title">
+            Switching to <strong>{switching.name}</strong>
+          </span>
+          <span className="vault-switch-sub">
+            {switching.orgId
+              ? "Opening its folder and catching up on sync…"
+              : "Opening its folder…"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Shown when a vault is active but has no local folder yet (freshly created
  * or joined). Rather than silently reusing whatever folder is open, ask the
  * user to point this vault at its own folder — or start with an empty one.
@@ -230,8 +302,14 @@ function VaultFolderPrompt() {
             generic pitch — both at once read as a wall of text. */}
         {pending.reason ? (
           <div className="wf-notice" role="alert">
-            <p>{pending.reason.text}</p>
-            {pending.reason.path && <code>{pending.reason.path}</code>}
+            <svg className="wf-notice-glyph" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+              <path d="M12 9v4M12 17h.01" />
+            </svg>
+            <div className="wf-notice-body">
+              <p>{pending.reason.text}</p>
+              {pending.reason.path && <code>{pending.reason.path}</code>}
+            </div>
           </div>
         ) : (
           <p className="wf-desc">
@@ -321,8 +399,17 @@ function UpdateGate() {
   return (
     <div className="update-gate" role="alertdialog" aria-modal="true" aria-label="Update required">
       <div className="update-gate-card">
-        {version && <span className="update-gate-version">Version {version}</span>}
-        <h1>Update required</h1>
+        <div className="update-gate-badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 4v11" />
+            <path d="m7 10 5 5 5-5" />
+            <path d="M4 19h16" />
+          </svg>
+        </div>
+        <div className="update-gate-heading">
+          <h1>Update required</h1>
+          {version && <span className="update-gate-version">v{version}</span>}
+        </div>
         {update.phase === "available" && (
           <>
             <p>
@@ -534,25 +621,53 @@ function SyncIndicator({ noteOpen }: { noteOpen: boolean }) {
 }
 
 /**
- * Sign-in dialog raised by a flow, not by a click — today only the shared-link
- * flow: a baalda:// link arrived while signed out, the link itself is queued in
- * lib/noteLinkFlow, and signing in here opens it automatically. Dismissing the
- * dialog abandons the link (and the vault-landing request it armed) so nothing
- * fires on a later, unrelated sign-in. Mounted in BOTH root branches — a
- * signed-out user can receive a link with or without a folder open.
+ * Sign-in dialog raised by a flow, not by a click. Two flows use it, both
+ * arriving as a `baalda://` deep link while the app is signed out:
+ *
+ *   - "note-link": a shared note. The link is queued in lib/noteLinkFlow and
+ *     signing in here opens it automatically.
+ *   - "server-link": a server invite (#91). The offered URL is parked in
+ *     `pendingServerLink` and the dialog opens on its confirm step, so a
+ *     self-hosting team can send one link instead of dictating a URL.
+ *   - "invite": a team invitation link; the card names the vault + address.
+ *   - "sign-in": a password was reset in the browser and this device's session
+ *     went with it; the card opens ready for the new password.
+ *
+ * Dismissing the dialog abandons whichever was pending (and, for a note link,
+ * the vault-landing request it armed) so nothing fires on a later, unrelated
+ * sign-in. Mounted in BOTH root branches — a signed-out user can receive a link
+ * with or without a folder open.
  */
 function PromptedAuthDialog() {
   const authPrompt = useStore((s) => s.authPrompt);
-  if (authPrompt !== "note-link") return null;
+  if (
+    authPrompt !== "note-link" &&
+    authPrompt !== "server-link" &&
+    authPrompt !== "invite" &&
+    authPrompt !== "sign-in"
+  ) {
+    return null;
+  }
   return (
-    <AuthDialog
-      onSignedIn={() => useStore.getState().setAuthPrompt(null)}
-      onClose={() => {
-        clearPendingNoteLink();
-        requestOpenVault(null);
-        useStore.getState().setAuthPrompt(null);
-      }}
-    />
+    <Suspense fallback={null}>
+      <AuthDialog
+        // An invitee usually has no account yet — the link is often the first
+        // time they hear of us — so the invite card opens on sign-up.
+        initialMode={authPrompt === "invite" ? "sign-up" : "sign-in"}
+        onSignedIn={() => useStore.getState().setAuthPrompt(null)}
+        onClose={() => {
+          clearPendingNoteLink();
+          requestOpenVault(null);
+          useStore.getState().clearServerLink();
+          // Dismissing the card declines for now: drop the queued invitation too,
+          // or the next unrelated sign-in would surprise-join a vault.
+          // Unconditional, because an invitation can be parked behind the
+          // "server-link" prompt as well — the invite that offered the server.
+          useStore.getState().clearInvitePrompt();
+          useStore.getState().setAuthPrompt(null);
+        }}
+      />
+    </Suspense>
   );
 }
 
@@ -569,12 +684,26 @@ export default function App() {
   const versionPanelOpen = useStore((s) => s.versionPanelDocId != null);
   // An open image/PDF preview isn't a synced note — hide the save/sync chrome.
   const isPreview = openNote != null && previewKind(openNote.path) != null;
-  const [booting, setBooting] = useState(true);
+  // Covers the LAST VAULT'S OPEN and nothing else. It used to cover the whole
+  // session restore + sync reconcile too, which is why launch showed "Loading…"
+  // for seconds on a big vault: the sidebar was ready long before auth was.
+  const [openingLastVault, setOpeningLastVault] = useState(true);
   const [graphOpen, setGraphOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const { width: sidebarWidth, setWidth: setSidebarWidth } = useSidebarWidth();
   // Guards the launch auto-reopen against StrictMode's double-invoke (dev).
   const didAutoReopenRef = useRef(false);
+
+  // Reveal the window on React's FIRST commit — deliberately not on the tree
+  // or on `!booting`. That first commit is the themed shell, so the user gets a
+  // correctly coloured window immediately instead of an empty frame while the
+  // bundle parses; holding it back until the sidebar has data would hide the
+  // app for the whole boot sequence. Effects run before the `booting` early
+  // return below, so this fires on the shell.
+  useEffect(() => {
+    revealWindowOnce();
+    prefetchAfterPaint();
+  }, []);
 
   // The history panel is about ONE note; switching notes under it would leave a
   // list of versions that no longer belong to what's in the editor.
@@ -616,7 +745,21 @@ export default function App() {
           // former carries the vault epoch this session must pin its writes to
           // (`get_last_vault` reports the epoch from before it opened anything).
           useStore.getState().setVault(opened ?? last);
+          // Does this folder belong to a synced vault? One ~60-byte IPC, fired
+          // WITHOUT awaiting so it can't delay the paint. It is what tells a
+          // click that beats the sync prime whether waiting for a doc-id map is
+          // worth it — see `lib/sync/openGate`.
+          void ipc
+            .peekVaultStamp((opened ?? last).path)
+            .then((stamp) => {
+              if (useStore.getState().vault?.path !== (opened ?? last).path) return;
+              useStore.setState({ openFolderIsSynced: stamp?.organizationId != null });
+            })
+            .catch(() => {
+              /* unreadable: stays null, so the gate keeps waiting for the prime */
+            });
           await useStore.getState().refreshTree();
+          perf.mark("tree-ready");
           // Not awaited: the index rebuild runs in the background now (#84), and
           // this call parks on its lock until it commits. The tree above needs
           // no index, so the vault is on screen while the rebuild runs; titles
@@ -625,14 +768,20 @@ export default function App() {
         }
       } catch (e) {
         console.error("auto-reopen failed", e);
-      }
-      try {
-        await useStore.getState().initAuth();
-      } catch (e) {
-        console.error("auth init failed", e);
       } finally {
-        setBooting(false);
+        // The tree is in the store; NOTHING below this line may gate the paint.
+        setOpeningLastVault(false);
+        // The frame AFTER the state flush is the one the user sees.
+        requestAnimationFrame(() => perf.mark("tree-painted"));
       }
+      // Detached, deliberately: the session restore is 3+ HTTP round trips and
+      // it ends in the sync reconcile, which on a large vault is minutes of
+      // work. Every `set()` inside it is generation-guarded (`authInitGen`), so
+      // a sign-in/sign-out the user performs meanwhile still wins.
+      void useStore
+        .getState()
+        .initAuth()
+        .catch((e) => console.error("auth init failed", e));
       // Check for updates at launch AND on a background poll, but never install
       // uninvited: a found release raises the required-update wall (UpdateGate),
       // and the download/relaunch waits for the user's "Install & Restart" click.
@@ -708,6 +857,14 @@ export default function App() {
               // and merges genuine external edits live into the open Y.Text.
               bridgeManager.handleFileChanged(e.path);
             }
+            // …and the sync layer sees it either way. Deleting the note you have
+            // open must reach the team exactly like deleting a closed one, and
+            // the `modified` half of a third-party atomic save is what CANCELS
+            // that delete inside its grace window — so skipping these events for
+            // the open note is what made an open note behave differently from
+            // every other one. The sync layer's own suppressed-doc guard keeps
+            // the open note out of the content-push queue.
+            forSync.push(e);
             continue;
           }
           // Everything that is NOT the open note goes to the sync layer: an
@@ -731,6 +888,7 @@ export default function App() {
       unlistenIndex = await ipc.onIndexReady((e) => {
         const vault = useStore.getState().vault;
         if (!vault || vault.epoch !== e.epoch) return;
+        perf.mark("index-ready");
         if (!e.ok) toast("Couldn't finish indexing this vault — search and backlinks may be incomplete.", "error");
         void useStore.getState().refreshTitles();
         void useStore.getState().refreshBacklinks();
@@ -844,7 +1002,11 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  if (booting) {
+  // Only while we still don't know WHICH folder to show. `setVault` lands
+  // before `refreshTree` resolves, so the app shell appears the instant the
+  // vault is known; keeping the `!vault` conjunct is what stops VaultPicker
+  // flashing for the 10–50ms of `getLastVault` + `openVault` on a relaunch.
+  if (openingLastVault && !vault) {
     return <div className="booting">Loading…</div>;
   }
 
@@ -855,7 +1017,11 @@ export default function App() {
     return (
       <div className="app-shell">
         <UpdateGate />
-        <VaultPicker />
+        {/* Reusing `.booting` means the loading→welcome hand-off reads as one
+            continuous boot rather than a flash of a second loader. */}
+        <Suspense fallback={<div className="booting">Loading…</div>}>
+          <VaultPicker />
+        </Suspense>
         <VaultFolderPrompt />
         <PromptedAuthDialog />
       </div>
@@ -867,6 +1033,7 @@ export default function App() {
       {/* Window-global, above the sidebar+main split: a new release must be
           visible the moment the poll finds it, whatever is on screen. */}
       <UpdateGate />
+      <VaultSwitchOverlay />
       <PromptedAuthDialog />
       <div
         className="app"
@@ -984,7 +1151,19 @@ export default function App() {
           <RemovedBanner />
           <DeletedByTeammateBanner />
           <div className="editor-wrap">
-            <Editor />
+            {openNote ? (
+              <Suspense
+                fallback={
+                  <div className="editor-column">
+                    <EditorSkeleton />
+                  </div>
+                }
+              >
+                <Editor />
+              </Suspense>
+            ) : (
+              <EditorEmpty />
+            )}
           </div>
           <BacklinksPanel />
           {/* Slides in over the editor from the right; anchored to .main. */}
@@ -997,7 +1176,11 @@ export default function App() {
             resetKeys={[graphOpen]}
             onError={() => setGraphOpen(false)}
           >
-            <GraphView onClose={() => setGraphOpen(false)} />
+            {/* `.graph-view` is the full-window overlay itself, so the screen
+                dims the instant the graph is asked for, then fills in. */}
+            <Suspense fallback={<div className="graph-view" aria-busy="true" />}>
+              <GraphView onClose={() => setGraphOpen(false)} />
+            </Suspense>
           </ErrorBoundary>
         )}
         <VaultFolderPrompt />

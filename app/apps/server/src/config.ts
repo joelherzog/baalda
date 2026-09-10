@@ -54,6 +54,15 @@ function int(name: string, fallback: number): number {
   return n;
 }
 
+/** `DEEP_LINK_SCHEME`, validated to the shape a URL scheme may take. */
+function deepLinkScheme(): string {
+  const v = optional("DEEP_LINK_SCHEME") ?? "baalda";
+  if (!/^[a-z][a-z0-9+.-]{0,63}$/.test(v)) {
+    throw new Error(`DEEP_LINK_SCHEME must be a URL scheme like "baalda" (got "${v}")`);
+  }
+  return v;
+}
+
 /** An env var that may be absent; empty string is treated as unset. */
 function optional(name: string): string | undefined {
   const v = process.env[name];
@@ -134,6 +143,29 @@ export const config = {
    *  on email+password alone. Set only via env (never committed). */
   googleClientId: optional("GOOGLE_CLIENT_ID"),
   googleClientSecret: optional("GOOGLE_CLIENT_SECRET"),
+  /**
+   * URL scheme of the desktop app this server's pages bounce into (`/open/*`,
+   * `/invite/:id`, `/email-verified`, `/reset-password`). The released app
+   * registers `baalda`; the Staging app registers `baalda-staging`, so a staging
+   * server must say so or its links open whichever app grabbed `baalda://` last
+   * on a machine that has both installed.
+   */
+  deepLinkScheme: deepLinkScheme(),
+  // ---- Outbound email (issue #99) ----
+  /** Sender address, e.g. `Baalda <no-reply@example.com>`. Required to send
+   *  anything; with it and ONE transport below, password reset + sign-up
+   *  verification + invitation emails switch on. Unset ⇒ email off, and every
+   *  feature that needs it is simply not offered. Resolution + validation live
+   *  in `email/mailer.ts` (`resolveEmailConfig`), which throws at startup on a
+   *  half-configured setup rather than offering reset links that never arrive. */
+  emailFrom: optional("EMAIL_FROM"),
+  /** SMTP connection URL: `smtp://user:pass@host:587` or `smtps://…:465`. */
+  smtpUrl: optional("SMTP_URL"),
+  /** Resend API key (https://resend.com) — the HTTP alternative to SMTP. */
+  resendApiKey: optional("RESEND_API_KEY"),
+  /** Force a transport (`smtp` | `resend` | `log` | `memory`). Normally inferred
+   *  from which credential is set; `log`/`memory` are dev/test only. */
+  emailTransport: optional("EMAIL_TRANSPORT"),
   // ---- Subscription billing (Polar) ----
   /** Polar organization access token. Its presence is the ON switch for the
    *  whole billing feature (see `billingEnabled` below): unset ⇒ billing is
@@ -153,11 +185,13 @@ export const config = {
    *  to this many UNSUBSCRIBED vaults; each unsubscribed vault may hold
    *  up to this many members (incl. pending invitations).
    *
-   *  Members sit well above vaults on purpose: a free vault should be able to
-   *  hold a real team, so the upgrade prompt arrives when a group outgrows the
-   *  product rather than the moment it stops being a pair. */
+   *  3 × 3 since 2026-09-09 (members were 10 from 2026-08-07 to then). The
+   *  member cap gates only NEW seats — invitations and join-code redemptions
+   *  (`canAddMember`) — so a free vault that already holds more than the cap
+   *  keeps every existing member and simply cannot add another until it goes
+   *  Pro; nobody is removed or locked out by lowering this number. */
   freeMaxVaults: int("FREE_MAX_VAULTS", 3),
-  freeMaxMembers: int("FREE_MAX_MEMBERS", 10),
+  freeMaxMembers: int("FREE_MAX_MEMBERS", 3),
   /** Hard ceiling on a single note-sync message / note body, in MB. Real notes
    *  are tiny (production p99 ≈ 600 kB; the largest legitimate page ≈ 7 MB), so
    *  anything past this is a runaway — most likely a forked-note feedback loop

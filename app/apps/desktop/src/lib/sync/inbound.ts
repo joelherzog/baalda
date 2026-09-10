@@ -80,8 +80,11 @@ export interface InboundTrash {
    * `deleted` — the server tombstoned it: someone deleted the note.
    * `revoked` — it left the caller's readable set: access was taken away.
    *
-   * They execute identically (release the doc, move it to the vault trash) but
-   * carry different risk, so they get separate safety caps and separate
+   * Both release the doc and take the file off disk, but differently: a deleted
+   * note goes to the vault's recoverable trash (the undo for a deliberate
+   * removal), a revoked one is removed outright (the server still holds it, and
+   * a trash copy would keep the readable `.md` the revocation takes away). They
+   * also carry different risk, so they get separate safety caps and separate
    * wording when one is refused. A wrong `deleted` is a server bug destroying
    * work; a mass `revoked` is a routine admin action that happens to look the
    * same from here.
@@ -100,8 +103,11 @@ export interface InboundPlan {
   /** Folder paths to create locally, parents before children. */
   createFolders: string[];
   /**
-   * Local folder paths the server has DELETED (tombstoned by id), children
-   * before parents. The executor removes each one only if it is empty by then —
+   * Local folder paths that must leave this disk, children before parents: the
+   * server DELETED them (tombstoned by id), MOVED them elsewhere (the emptied
+   * old directory), or took this user's access away (the id vanished from the
+   * permission-filtered listing without a tombstone — a folder made private).
+   * The executor removes each one only if it is empty by then —
    * the notes inside leave via their own tombstones in {@link trash} first, and
    * a folder still holding anything (an unconfirmed orphan, a stray image, a
    * new local note) stays on disk and re-registers under a fresh id, which is
@@ -273,8 +279,24 @@ export function planInbound(input: InboundInput): InboundPlan {
   // folder id, exactly like note tombstones) is what makes the delete provable;
   // without it, a device still holding the folder locally re-registered it on
   // its next pull and the deleted folder came back for the whole team.
+  //
+  // Every comparison here is case-insensitive, exactly like the notes below
+  // (`samePath`), because the filesystem is: on macOS and Windows
+  // `Projects/community` and `Projects/Community` are ONE directory. Comparing
+  // spellings instead of directories made a vault whose disk and server
+  // disagreed on one letter (a rename-by-case on one device, or migration 023
+  // merging case-duplicated rows) loop forever: `Content/pipeline` — an EMPTY
+  // server folder under the mis-cased parent — read as "missing locally", so
+  // pull N `ensureFolder`ed it (create_dir_all lands inside the existing
+  // directory regardless of case); the watcher's `tree` event requested pull
+  // N+1, which now saw the local spelling of that same id "moved" to the
+  // server's spelling and removed the empty directory again; the watcher
+  // requested pull N+2… One idle client pulled the whole registry (450 KB)
+  // every 1.5 s for days, with the sync badge blinking Syncing/Synced (#98).
+  const localFoldersCi = new Set([...input.localFolders].map((p) => p.toLowerCase()));
+  const serverFoldersCi = new Set([...input.serverFolders].map((p) => p.toLowerCase()));
   for (const path of input.serverFolders) {
-    if (input.localFolders.has(path)) continue;
+    if (localFoldersCi.has(path.toLowerCase())) continue;
     if (!isSafeFolderPath(path)) {
       plan.rejected.push({
         kind: "folder",
@@ -297,9 +319,10 @@ export function planInbound(input: InboundInput): InboundPlan {
   if (input.serverFolderIds && input.localFolderIds) {
     for (const [path, id] of input.localFolderIds) {
       const now = input.serverFolderIds.get(id);
-      if (now === undefined || now === path) continue;
-      if (!input.localFolders.has(path)) continue; // already gone locally
-      if (input.serverFolders.has(path)) continue; // re-created server-side
+      // A spelling disagreement is not a move: same directory on disk.
+      if (now === undefined || samePath(now, path)) continue;
+      if (!localFoldersCi.has(path.toLowerCase())) continue; // already gone locally
+      if (serverFoldersCi.has(path.toLowerCase())) continue; // re-created server-side
       if (!isSafeFolderPath(path)) continue;
       plan.removeFolders.push(path);
     }
@@ -311,8 +334,8 @@ export function planInbound(input: InboundInput): InboundPlan {
   if (input.folderTombstones && input.localFolderIds) {
     for (const [path, id] of input.localFolderIds) {
       if (!input.folderTombstones.has(id)) continue;
-      if (!input.localFolders.has(path)) continue; // already gone locally
-      if (input.serverFolders.has(path)) continue; // re-created server-side
+      if (!localFoldersCi.has(path.toLowerCase())) continue; // already gone locally
+      if (serverFoldersCi.has(path.toLowerCase())) continue; // re-created server-side
       if (!isSafeFolderPath(path)) {
         plan.rejected.push({
           kind: "folder",
@@ -323,6 +346,54 @@ export function planInbound(input: InboundInput): InboundPlan {
         continue;
       }
       plan.removeFolders.push(path);
+    }
+  }
+  // A local folder whose recorded server id is neither listed nor tombstoned
+  // has left this user's VISIBLE set: the folder (or the share that made it
+  // reachable) was made private. `GET /api/folders` is permission-filtered, so
+  // the folder simply stops being listed — no tombstone, because nothing was
+  // deleted. Its notes leave via their own `revoked` entries below, and without
+  // this rule the emptied directory stayed in the sidebar forever ("Getting
+  // Started", contents gone, folder still there) and the outbound half kept
+  // re-adopting its hidden id on every pull.
+  //
+  // Same gates as a note revocation: the id must be one WE recorded (a folder
+  // with no server id was never agreed ours — absence then proves nothing), the
+  // server must have answered about deletions at all (`null` tombstones means
+  // "I don't know", and a truncated listing looks exactly like a mass revoke),
+  // and the path must not have been re-created server-side under a fresh id.
+  // Removal is still empty-only, so a folder holding anything the note pass
+  // refused to trash stays on disk. Capped like note revocations.
+  if (input.folderTombstones && input.serverFolderIds && input.localFolderIds) {
+    const revoked: string[] = [];
+    for (const [path, id] of input.localFolderIds) {
+      if (input.serverFolderIds.has(id)) continue; // listed (or moved) — handled above
+      if (input.folderTombstones.has(id)) continue; // deleted — handled above
+      if (!localFoldersCi.has(path.toLowerCase())) continue; // already gone locally
+      if (serverFoldersCi.has(path.toLowerCase())) continue; // re-created server-side
+      if (!isSafeFolderPath(path)) {
+        plan.rejected.push({
+          kind: "folder",
+          path,
+          docId: null,
+          reason: "unsafe local folder path",
+        });
+        continue;
+      }
+      revoked.push(path);
+    }
+    const cap = revokeCap(input.localFolderIds.size);
+    if (revoked.length > cap) {
+      for (const path of revoked) {
+        plan.rejected.push({
+          kind: "folder",
+          path,
+          docId: null,
+          reason: `refused: ${revoked.length} folder access removals in one pass exceeds the ${cap} safety limit`,
+        });
+      }
+    } else {
+      plan.removeFolders.push(...revoked);
     }
   }
   // Children before parents, so an emptied subtree unwinds bottom-up.

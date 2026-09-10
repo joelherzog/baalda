@@ -16,9 +16,12 @@ tags: [baalda, status, roadmap]
   and desktop (bridge + auth + per-doc sync + presence + sharing UI + attachment sync)
   are wired end-to-end and tested.
 - **Deployment:** 🟢 Production-ready (2026-07-15). The sync WebSocket is served on the HTTP
-  port at `/sync` (single-port topology), and the repo ships a Dockerfile, `railway.json`
-  (pre-deploy migrations + healthcheck), and [[DEPLOY]]. The managed backend is live at
+  port at `/sync` (single-port topology), and the repo ships a Dockerfile, Railway IaC at
+  `app/.railway/railway.ts` (Dockerfile build, pre-deploy migrations + healthcheck), and [[DEPLOY]]. The managed backend is live at
   `https://api.baalda.com`; desktop releases ship via `v*` tags → signed installers → Tauri updater.
+- **Billing:** 🟢 Per-vault Pro via Polar, with the full subscription lifecycle (2026-09-09, #109–#111):
+  deleting a vault cancels at period end before it deletes, subscriptions survive as tombstones, and an
+  owner can transfer one between their vaults from Vault Settings → Billing.
 - **Next action:** Phase 4 polish / launch decisions (WYSIWYG, vector search, OAuth, iOS).
 
 > **Requirement coverage:** Phases 0–3 deliver **10 of the 12** core requirements,
@@ -195,9 +198,37 @@ Six changes that together make a vault something a team can actually govern.
   with no verification at sign-up, someone can register an address they don't own, and linking then
   joins the real owner to the squatter's account rather than locking them out. Accepted because the
   squat is already possible without linking and Google's verified email is the strongest signal we
-  have. **Email verification at sign-up is the real fix** and is still owed.
+  have. **Email verification at sign-up is the real fix** — it now ships (soft) when email is
+  configured, see below; requiring it is still owed.
 - [x] Pinned by a config test — the failure mode was a silent default, so the three options that
   have to agree (`enabled`, `trustedProviders`, `requireLocalEmailVerified`) are asserted together.
+
+### Password reset, verification + invitation emails ✔ (#99)
+- [x] Outbound email is opt-in via env (`EMAIL_FROM` + `SMTP_URL` or `RESEND_API_KEY`; `email/mailer.ts`),
+  on the Google-OAuth pattern: unconfigured servers offer none of it, `GET /api/auth-methods`
+  advertises `passwordReset` / `invitationEmail`, and the desktop keys its controls off that.
+- [x] **Password reset**: "Forgot password?" in the desktop dialog and on `/oauth/login` →
+  `POST /api/password-reset/request` (ours, not Better Auth's neutral endpoint: it answers sent /
+  `no_account` / `send_failed` with the provider's reason, so a wrong-server address or a refused
+  send is said out loud) → emailed single-use, 1-hour link to the server-rendered `/reset-password`
+  page → Better Auth `reset-password` (revokes other sessions; creates the credential for a
+  Google-only account, so the same flow sets a first password) → `baalda://signin` bounces back into
+  the app, which notices its revoked session and opens the sign-in card. Admin escape hatch for
+  servers without email: `pnpm run set-password -- <email>`.
+- [x] **Sign-up verification email** (soft): sent on sign-up, `emailVerified` set on click, lands on
+  `/email-verified` → `baalda://verified` → the app re-reads its session; Account settings shows
+  "Email confirmed ✓" / a Resend button. Not yet required to sign in — pre-existing accounts were
+  never verified.
+- [x] **Invitation emails** → `POST /api/invitations/:id/send` (explicit, reports sent/failed; not a
+  Better Auth hook, which swallows send errors) → `/invite/:id` landing page →
+  `baalda://invite/<id>?server=` deep link → the app signs in/up with the invited address and
+  accepts. Members shows "Invitation emailed" only on a confirmed send, the provider's error + the
+  link otherwise, plus Copy-link + Revoke per pending invitation. Re-inviting re-sends.
+- [x] **Invite inbox actually works**: Better Auth's `list-user-invitations` 403s for any unverified
+  email (= every password sign-up), so the in-app inbox had been empty for almost everyone.
+  `GET /api/invitations/mine` reads the table directly; the desktop uses it first.
+- [x] **Join code = email invite**: redeeming a code consumes a pending invitation for the same address
+  (invited role honoured, invitation marked accepted, seat not double-counted).
 
 ### Phase 4: Polish / upgrades _(deferred)_ ⬜
 - [ ] Structural rich-text CRDT (y-prosemirror / `Y.XmlFragment`) for full WYSIWYG.

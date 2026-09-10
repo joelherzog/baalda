@@ -19,6 +19,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const fakeRegistry = vi.hoisted(() => {
   const reg = {
     vaultId: null as string | null,
+    // Phase A of `enable`: the local prime. False here — this suite is about the
+    // reconcile-and-teardown path, and a prime that adopts nothing is exactly
+    // the pre-prime behaviour these assertions were written against.
+    primeLocal: vi.fn(async (_orgId: string) => false),
     reconcile: vi.fn(async () => ({ seeded: false })),
     // Resolves true ("something changed") so the tests can assert the tree
     // refresh fires — a false pull deliberately skips it to avoid flicker.
@@ -119,7 +123,7 @@ describe("SyncManager.disable — teardown completeness", () => {
     fakeRegistry.reset.mockClear();
 
     // Arm the debounced registry pull, then tear down before it can fire.
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     expect(sm.hasPendingRegistryPull()).toBe(true);
 
     const scope = sm.currentScope()!;
@@ -152,7 +156,7 @@ describe("SyncManager.disable — teardown completeness", () => {
 
     // An in-flight frame from the vault we just left. Arming here is what created
     // the original bug, so the guard has to reject it outright.
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     expect(sm.hasPendingRegistryPull()).toBe(false);
     await vi.advanceTimersByTimeAsync(5000);
     expect(fakeRegistry.pull).not.toHaveBeenCalled();
@@ -185,7 +189,7 @@ describe("SyncManager registry-pull timer across a vault switch", () => {
       path: "/vaults/a",
       epoch: 1,
     });
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     expect(sm.hasPendingRegistryPull()).toBe(true);
 
     // Deliberately NOT calling disable(): this models a call site that swaps the
@@ -209,7 +213,7 @@ describe("SyncManager registry-pull timer across a vault switch", () => {
       path: "/vaults/a",
       epoch: 1,
     });
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     await vi.advanceTimersByTimeAsync(300);
     expect(fakeRegistry.pull).toHaveBeenCalledTimes(1);
     expect(refreshed).toHaveBeenCalledTimes(1);
@@ -220,7 +224,7 @@ describe("SyncManager registry-pull timer across a vault switch", () => {
 describe("SyncManager — settling after a teammate's structural change", () => {
   /** Enable, then fire a debounced registry pull and let it land. */
   async function pullOnce(sm: SyncManager) {
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     await vi.advanceTimersByTimeAsync(300);
     await vi.advanceTimersByTimeAsync(0);
   }

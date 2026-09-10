@@ -37,6 +37,11 @@ collaborative apps (Notion, Confluence) keep your data in their database. Baalda
   for teams under about 50 people editing at once. Quote the measured numbers to a buyer.
 - **Freeze vault root**: a setting that stops anyone, including owners, from adding new items at
   the top level once the structure is settled.
+- **Deleting a vault** is the owner's call and it is permanent on the server: the notes, the
+  history and everyone's access go. Your own `.md` files stay on your disk unless you also
+  choose to move the folder to the Trash. If the vault is on Pro, deleting it also stops the
+  subscription (see "Hosting options"); if that step fails, nothing is deleted and Baalda shows
+  the error.
 
 ## Writing
 
@@ -70,15 +75,32 @@ collaborative apps (Notion, Confluence) keep your data in their database. Baalda
 - Sync is always on in the background for the whole vault, not just the open note, so notes are
   already up to date before you click them.
 - What travels: binary change records, never whole files. Each device rebuilds its own `.md`.
-- Deleting a file on disk does not delete it for the team (deliberate safety rule). Delete inside
-  the app to remove it everywhere.
-- Renames and moves are tracked by a stable note id, so nothing forks or loses its history.
+- Deleting a note's file on disk (in Finder, with `rm`, or by asking an AI to tidy the vault) does
+  remove it for the team, a couple of seconds later. Your own copy of the text is kept in the
+  vault's hidden trash folder first, so a mistake is recoverable by hand.
+  Two things are never propagated: a delete of a note this device had not finished uploading, and a
+  mass disappearance (more than a fifth of the vault at once), because an unmounted drive or a
+  cloud-storage hiccup looks exactly like a bulk delete. Deleting inside the app is unchanged and
+  is still the clearest way to remove a note everywhere.
+- Renames and moves are tracked by a stable note id, so nothing forks or loses its history — that
+  holds for a rename done outside the app too.
 - Multiple vaults per account. Switch between them from the account menu.
 
 ## Team collaboration
 
 - **Invite** teammates by email, or hand out a **join code**. Invitations expire after 48 hours.
+  On a server with email configured (the managed service does) the invitee gets an email with a
+  link that opens Baalda on the invitation; otherwise Members shows a **Copy link** for each
+  pending invitation to paste into chat. Someone invited by email who uses the join code instead
+  ends up in exactly the same place, with the invited role.
 - **Roles**: owner, admin, member.
+- **Leaving a vault** (members and admins): Vault Settings → Vaults → **Leave** on the vault, then
+  confirm. Access ends on all your devices at once, the vault disappears from your switcher and
+  recents, and its folder on that device moves to the Trash (it is not kept as a local copy). The
+  owner gets an email that you left and you get a receipt, on servers that send email. To come
+  back you need a new invitation or join code. The **owner cannot leave** — their way out is to
+  delete the vault. "Remove from device" is the gentler option: it only detaches the folder on
+  that one device and keeps your membership.
 - **Live presence**: coloured cursors and selections in the note, "who is viewing" avatars,
   and small presence dots in the sidebar showing who is in which note or folder. Ping a
   teammate to get their attention.
@@ -97,7 +119,7 @@ collaborative apps (Notion, Confluence) keep your data in their database. Baalda
 - **Losing access** removes the note from the ex-reader's other devices (moved to trash, never
   destroyed); regaining access brings it back.
 - Not built (deferred): comments and @mentions, activity feed, audit log, sub-teams or custom
-  roles, SSO/SAML, two-factor authentication, email verification at sign-up.
+  roles, SSO/SAML, two-factor authentication, mandatory email verification.
 - **Public links**: turn a note into a read-only web page anyone with the link can read. Revoke
   any time. **Private links** (`baalda://note/...`) open a note for teammates who already have
   access; they carry no access themselves.
@@ -127,8 +149,11 @@ collaborative apps (Notion, Confluence) keep your data in their database. Baalda
 ## Accounts and security
 
 - Email + password accounts (argon2id hashing). Google sign-in is available when the server has
-  it configured (the managed service does). There is no email verification step yet and no
-  two-factor authentication.
+  it configured (the managed service does). **Forgot password?** on the sign-in screen emails a
+  one-hour reset link when the server has email configured (the managed service does; a
+  self-hosted server needs `EMAIL_FROM` + SMTP or Resend). An account created with Google can use
+  the same link to set a password. Sign-up sends a confirmation email but it isn't required to
+  sign in yet. No two-factor authentication.
 - Session token lives in the operating system keychain, never in a file.
 - Server stores binary sync records, not `.md` files; but it can reconstruct note text for
   search, public links and MCP, so it is **not end-to-end encrypted**. At-rest encryption is
@@ -148,18 +173,40 @@ collaborative apps (Notion, Confluence) keep your data in their database. Baalda
 
 - **Local only**: no server, no account, free.
 - **Self-hosted server**: Node + Postgres. Railway one-click, Docker Compose, or plain Docker.
-  Set the server URL in the app's settings. No plan limits, and Google sign-in / billing are
-  optional switches.
+  The app asks which server before your first sign-in ("Baalda managed service" or "Your own
+  server"), and the URL is checked against the server before it is saved; you can change it
+  later in Account settings → Connection. An account belongs to one server, so the sign-in form
+  always names the server it is signing you in to. Admins can send teammates one link,
+  `https://<your-server>/open/connect`, which opens the app and asks them to confirm.
+  No plan limits, and Google sign-in / billing are optional switches.
 - **Managed server** at `https://api.baalda.com` (the default in the app). Same code as the
   self-hosted server. It is live and self-serve today: a team can sign up, sync and collaborate
   right away on the free tier, and upgrade from inside the app when they hit a cap.
-  - **Free tier**: up to 3 vaults per user and 10 members per vault (members plus pending invites).
+  - **Free tier**: up to 3 vaults per user and 3 members per vault (members plus pending invites). A vault that already has more members than that keeps them all; it just cannot add another until it upgrades.
   - **Pro**: $10 per vault per month, or $97 per vault per year. Priced per vault, not per
     person. Unlocks unlimited members, notes, devices and AI edits; a Pro vault does not count
     toward the owner's free vaults. Two subscriptions exist today: monthly and yearly.
   - **How to buy**: Vault Settings → Billing → Upgrade to Pro (owners and admins). Checkout opens
     in the browser; the app flips to Pro as soon as payment lands. "Manage subscription" opens the
     billing portal for invoices, plan changes and cancellation.
+  - **One subscription per vault.** A vault that is already on Pro cannot be bought a second
+    time; the app refuses the checkout instead of charging twice.
+  - **Your subscriptions in one place**: Vault Settings → Billing lists every vault you are in —
+    plan, status, renewal date and price, how many people are in it, and who looks after billing.
+    It also says how many of your 3 free vaults are in use. The tab opens even when the vault you
+    have open is a local one.
+  - **Deleting a Pro vault stops the billing**, at the end of the period you already paid for:
+    no further charges, and the paid time is not cut short. If the payment provider cannot be
+    reached, the vault is *not* deleted and the app tells you why. The subscription itself is
+    kept in a "From deleted vaults" list so you can still move it, cancel it outright, or open
+    the billing portal for it.
+  - **Move a subscription to another vault** (owners only): Vault Settings → Billing → Transfer,
+    from a live vault or from one in "From deleted vaults". Transfer opens a dialog that lists
+    every vault it can move to — each with its member count and Free plan — and explains what
+    happens to the vault it leaves; pick one and confirm. Only vaults you own that are not already
+    on Pro are offered (Transfer is greyed out with a reason when there are none). Same price, same
+    billing period; if the subscription had been set to end because its vault was deleted,
+    transferring makes it renew again. The vault it came from drops to Free.
   - The public pricing page (baalda.com/pricing) may still describe the Team plan as early access
     or "talk to us". The app is ahead of the page: tell people they can upgrade in-app now, and
     to use the pricing page as the contact route if they want to talk first.

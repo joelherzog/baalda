@@ -34,12 +34,23 @@ export class NoteBridge {
 
   /** Count of updates in the persisted log since the last snapshot/compaction. */
   private logLength = 0;
+  /** Bytes in that log. The count above never reached its threshold on a real
+   *  vault while the BYTES did (see `compactBytes`), so both are tracked. */
+  private logBytes = 0;
+  /** One compaction at a time: the live trigger fires from an update callback,
+   *  and a second pass while the first is still writing its snapshot would
+   *  reset the counters twice for one truncation. */
+  private compacting = false;
   /** Monotonic count of every update ever observed on this doc (for assertions). */
   private observedUpdates = 0;
   /** Whether the oversize refusal has already been reported for the current
    *  run of oversized reads, so one runaway file logs once, not per watcher
    *  event. Cleared as soon as a normal-sized read comes through. */
   private oversizeReported = false;
+  /** Same one-report-per-run rule as {@link oversizeReported}, for the 0-byte
+   *  truncation refusal: a placeholder file that keeps being re-read must log
+   *  once, not per watcher event. */
+  private truncateReported = false;
   /** True once a recovery snapshot has been taken for a large diff. */
   private recoverySnapshotTaken = false;
   /** True once this doc has held non-empty text in this session. Guards egest:
@@ -99,9 +110,17 @@ export class NoteBridge {
       // Persist every update regardless of origin — it's part of doc history.
       this.observedUpdates++;
       this.logLength++;
-      void Promise.resolve(this.io.persistence.appendUpdate(this.docId, update)).catch(
-        (e) => this.reportError(e, "appendUpdate"),
-      );
+      this.logBytes += update.byteLength;
+      void Promise.resolve(this.io.persistence.appendUpdate(this.docId, update))
+        .then(() => {
+          // Compact LIVE, not only on the next load: one paste or AI rewrite can
+          // put megabytes into the log, and until now nothing shrank it until
+          // the note was reopened (and the row-count trigger never fired at
+          // all). Fire-and-forget — a failed compaction is a slower load, never
+          // a lost update: the log it would have replaced is still there.
+          if (this.shouldCompact()) void this.compact();
+        })
+        .catch((e) => this.reportError(e, "appendUpdate"));
     };
 
     this.onTextChange = (_evt, tr) => {
@@ -129,6 +148,11 @@ export class NoteBridge {
   }
   get pendingLogLength(): number {
     return this.logLength;
+  }
+  /** For tests/observability: bytes in the persisted log since the last
+   *  snapshot — the measure the compaction trigger actually watches. */
+  get pendingLogBytes(): number {
+    return this.logBytes;
   }
   get hasRecoverySnapshot(): boolean {
     return this.recoverySnapshotTaken;
@@ -159,6 +183,9 @@ export class NoteBridge {
         for (const u of state.updates) Y.applyUpdate(this.doc, u, "persistence");
       }, "persistence");
       this.logLength = state.updateCount;
+      // What the log actually COST to load, which is the number the compaction
+      // trigger cares about.
+      this.logBytes = state.updates.reduce((sum, u) => sum + u.byteLength, 0);
       if (this.text.length > 0) this.everHadContent = true;
       this.subscribe();
       // Baseline the echo guard at the current content so an identical file
@@ -173,7 +200,7 @@ export class NoteBridge {
       // doc must go through the deferred pull-before-seed path, never a
       // pre-sync ingest (that's the note-doubling bug).
       if (this.text.length > 0) this.ingest();
-      if (state.updateCount > this.cfg.compactThreshold) await this.compact();
+      if (this.shouldCompact()) await this.compact();
     } else {
       // No CRDT yet. Normally seed Y.Text from the file in a 'disk' transaction
       // (persisted but not echoed back as a write). When `seedOnOpen` is false
@@ -324,6 +351,28 @@ export class NoteBridge {
       return false;
     }
 
+    // The ingest twin of the empty-egest clobber guard. A file that is
+    // COMPLETELY empty against a doc that still holds text is not an edit we can
+    // safely believe: the registry materializes a server-only note as a 0-byte
+    // placeholder, and on a device that already holds that note's CRDT the
+    // placeholder used to be diff-merged as a delete-all and then PUSHED — the
+    // server's copy of the note destroyed by a file the app itself had just
+    // created (#93). A genuine partial truncation still applies below; only
+    // all-or-nothing is refused. See `allowTruncateFromDisk`.
+    if (fileText.length === 0 && current.length > 0 && !this.cfg.allowTruncateFromDisk) {
+      if (!this.truncateReported) {
+        this.truncateReported = true;
+        this.reportError(
+          new Error(
+            `${this._path} is 0 bytes: refusing to clear a doc holding ${current.length} chars`,
+          ),
+          "ingest:truncate",
+        );
+      }
+      return false;
+    }
+    this.truncateReported = false;
+
     const diffs = computeDiff(current, fileText);
     const ratio = changeRatio(diffs, current.length, fileText.length);
 
@@ -337,6 +386,7 @@ export class NoteBridge {
         const stateVector = Y.encodeStateVector(this.doc);
         await this.io.persistence.saveSnapshot(this.docId, snapshot, stateVector);
         this.logLength = 0;
+        this.logBytes = 0;
         this.recoverySnapshotTaken = true;
       } catch (e) {
         this.reportError(e, "ingest:recoverySnapshot");
@@ -477,6 +527,35 @@ export class NoteBridge {
     await this.drainEgest();
   }
 
+  /**
+   * Write the doc's text to disk NOW, whether or not an egest is pending.
+   *
+   * `flushEgest` deliberately no-ops with no timer armed, and after `hydrate`
+   * there is none: applying persisted CRDT state fires no text observer, and the
+   * echo hash is baselined at the doc's own text. Both are right for the normal
+   * flow and wrong for the one case that has to write anyway — the registry
+   * materializing a note this device already holds the content for, where the
+   * file on disk is a 0-byte placeholder the doc must fill in
+   * (`SyncManager.materializeContent`).
+   *
+   * Still goes through `drainEgest`, so the empty-over-non-empty guard, the
+   * atomic write, the retry backoff and the echo-hash bookkeeping all apply.
+   * Resolves true iff the file now holds the doc's bytes.
+   */
+  async writeThrough(): Promise<boolean> {
+    if (this.destroyed) return false;
+    if (this.egestTimer != null) {
+      this.clearT(this.egestTimer);
+      this.egestTimer = null;
+    }
+    // Force the write past the "the file already holds these bytes" shortcut:
+    // that answer comes from `lastWrittenHash`, which hydrate set from the DOC,
+    // not from the file.
+    this.lastWrittenHash = null;
+    await this.drainEgest();
+    return this.egestFailures === 0;
+  }
+
   // ---- Edit entry points -----------------------------------------------
 
   /** Apply a local editor edit (origin 'editor'); schedules an egest. */
@@ -554,12 +633,31 @@ export class NoteBridge {
 
   // ---- Compaction -------------------------------------------------------
 
+  /**
+   * Is the pending log worth replacing with a snapshot?
+   *
+   * Either measure alone is incomplete: many tiny updates (a long typing
+   * session) and a few enormous ones (a paste, an AI whole-file rewrite) both
+   * make a log that is slower to load than the snapshot it describes.
+   */
+  private shouldCompact(): boolean {
+    if (this.compacting || this.destroyed) return false;
+    if (this.cfg.compactBytes > 0 && this.logBytes > this.cfg.compactBytes) return true;
+    return this.logLength > this.cfg.compactThreshold;
+  }
+
   /** Merge the log into one snapshot and truncate it (spec 02 §4). */
   async compact(): Promise<void> {
-    const snapshot = Y.encodeStateAsUpdate(this.doc);
-    const stateVector = Y.encodeStateVector(this.doc);
-    await this.io.persistence.saveSnapshot(this.docId, snapshot, stateVector);
-    this.logLength = 0;
+    this.compacting = true;
+    try {
+      const snapshot = Y.encodeStateAsUpdate(this.doc);
+      const stateVector = Y.encodeStateVector(this.doc);
+      await this.io.persistence.saveSnapshot(this.docId, snapshot, stateVector);
+      this.logLength = 0;
+      this.logBytes = 0;
+    } finally {
+      this.compacting = false;
+    }
   }
 
   // ---- Teardown ---------------------------------------------------------

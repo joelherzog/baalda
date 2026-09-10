@@ -98,6 +98,43 @@ export interface Invitation {
   organizationId: string;
   inviterId?: string;
   expiresAt?: string;
+  /** Present on our own `/api/invitations/*` routes, absent on Better Auth's —
+   *  which is why every consumer treats both as optional and falls back. */
+  organizationName?: string;
+  inviterName?: string;
+}
+
+/**
+ * What an invitation id resolves to for someone who is not (yet) signed in as
+ * the invitee — the public shoulder-tap an invite deep link lands on.
+ *
+ * Public because the id IS the capability: an unguessable UUID that only ever
+ * reaches the invitee's inbox. It carries the vault name and who invited them
+ * so the sign-in card can say what the person is joining instead of asking for
+ * a password against an unexplained modal.
+ */
+export interface InvitationPreview {
+  id: string;
+  email: string;
+  role: string;
+  status: "pending" | "accepted" | "rejected" | "canceled" | "expired";
+  organizationId: string;
+  organizationName: string;
+  inviterName: string | null;
+  expiresAt?: string;
+}
+
+/**
+ * Which sign-in routes the server actually offers. Every field is a capability,
+ * so every field fails CLOSED — see {@link ApiClient.getAuthMethods}.
+ */
+export interface AuthMethods {
+  emailPassword: boolean;
+  google: boolean;
+  /** Server can send a "choose a new password" email. */
+  passwordReset: boolean;
+  /** Server delivers invitations by email (otherwise the admin shares a link). */
+  invitationEmail: boolean;
 }
 
 export interface Vault {
@@ -333,8 +370,80 @@ export interface OrgBilling {
   status: "none" | "active" | "past_due" | "canceled";
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
+  /** Cadence + price of the live subscription, straight from the provider's
+   *  snapshot — so a row can be priced without matching it back to a
+   *  `BillingPlan`. All three are null on a vault with no subscription
+   *  (#109). `amount` is minor units, like {@link BillingPlan.amount}. */
+  interval: "month" | "year" | null;
+  amount: number | null;
+  currency: string | null;
   /** `limit: null` = unlimited (paid). */
   seats: { members: number; pendingInvitations: number; limit: number | null };
+}
+
+/** One row of the Subscriptions list: a vault the caller belongs to. */
+export interface MyBillingVault {
+  orgId: string;
+  name: string;
+  role: "owner" | "admin" | "member";
+  plan: "free" | "pro";
+  status: "none" | "active" | "past_due" | "canceled";
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  interval: "month" | "year" | null;
+  amount: number | null;
+  currency: string | null;
+  seats: { members: number; pendingInvitations: number; limit: number | null };
+  /** The vault's owner — who to point a member at when they can't act. */
+  billingOwner: { userId: string; name: string; email: string } | null;
+  /** Owner or admin: may upgrade this vault or open its portal. */
+  canManage: boolean;
+  /** Owner AND the subscription is live: may move it to another vault. */
+  canTransfer: boolean;
+}
+
+/**
+ * A subscription whose vault is gone. Deleting a vault cancels its
+ * subscription at the period end rather than instantly, so the paid time the
+ * user already bought survives the vault — and has to be reachable from
+ * somewhere (#109/#111). The server keeps the row as a tombstone; this is it.
+ */
+export interface OrphanedSubscription {
+  orgId: string;
+  orgName: string | null;
+  deletedAt: string;
+  status: "active" | "past_due";
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  interval: "month" | "year" | null;
+  amount: number | null;
+  currency: string | null;
+}
+
+/**
+ * Every subscription the caller can see or act on, in one shot. The per-vault
+ * `GET /api/billing/orgs/:orgId` can't answer this: role is only known for the
+ * active org and plan is only known one org at a time.
+ */
+export interface MyBilling {
+  vaults: MyBillingVault[];
+  orphaned: OrphanedSubscription[];
+  freeLimits: {
+    vaultsPerUser: number;
+    membersPerVault: number;
+    /** Owned vaults with no subscription — what counts against the cap. */
+    freeVaultsUsed: number;
+  };
+}
+
+/** What `DELETE /api/orgs/:orgId` reports back. */
+export interface VaultDeleteResult {
+  deleted: boolean;
+  vaults: number;
+  docs: number;
+  /** Set when the deleted vault carried a live subscription: the server told
+   *  the provider to stop at the period end, and this is when that is. */
+  subscription: { cancelAtPeriodEnd: boolean; currentPeriodEnd: string | null } | null;
 }
 
 /** A rejected server response — carries the HTTP status for callers to branch on. */
@@ -348,6 +457,34 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+/**
+ * A server address didn't check out. Thrown by {@link ApiClient.health}, which
+ * is the one probe in this file that must NOT fail closed.
+ *
+ * The two kinds are worth telling apart because they send the user to different
+ * places: `unreachable` means look at the URL, the DNS and whether the box is
+ * up; `not-baalda` means the address is fine and something else is answering on
+ * it (a proxy's default page, a different app, the wrong port).
+ */
+export class ServerCheckError extends Error {
+  constructor(
+    public kind: "unreachable" | "not-baalda",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ServerCheckError";
+  }
+}
+
+/** How long a server gets to answer `/health` before we call it unreachable. */
+export const HEALTH_TIMEOUT_MS = 6000;
+
+// The two things a person can actually act on. Kept as constants so the dialog
+// and Settings → Connection say the same words for the same failure.
+const UNREACHABLE_MESSAGE =
+  "Couldn't reach that server. Check the URL and that it's online.";
+const NOT_BAALDA_MESSAGE = "That address answered, but it isn't a Baalda server.";
 
 type FetchLike = typeof fetch;
 
@@ -480,6 +617,64 @@ export class ApiClient {
     return { data: parsed as T, authToken };
   }
 
+  // ---- Reachability -------------------------------------------------------
+
+  /**
+   * Is there a Baalda server at this address? Resolves if yes, throws a
+   * {@link ServerCheckError} if no.
+   *
+   * The ONE probe in this file that fails OPEN, and it exists precisely because
+   * the other two don't. `getAuthMethods` and `getBillingConfig` are capability
+   * probes: they swallow every failure and answer "not configured", which is
+   * right for deciding whether to draw a button and useless for telling someone
+   * their server URL is wrong. Building the onboarding check on either of them
+   * would report "connected" for a typo'd hostname.
+   *
+   * Takes an explicit `baseUrl` because it runs BEFORE the URL is adopted —
+   * validating a candidate must not disturb the client's current base or its
+   * token. It also sends no `Authorization`: `/health` is public, and the point
+   * is to test the address, not the session.
+   *
+   * `AbortController` rather than a bare `fetch`: a host that accepts the TCP
+   * connection and then says nothing (a firewall, a hung proxy) would otherwise
+   * leave the Connect button spinning indefinitely.
+   */
+  async health(baseUrl?: string): Promise<void> {
+    const base = stripTrailingSlash((baseUrl ?? this.baseUrl).trim());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${base}/health`, {
+        method: "GET",
+        headers: { Accept: "application/json", [ORIGIN_HEADER]: this.clientId },
+        signal: controller.signal,
+      });
+    } catch {
+      // A timeout, DNS failure, refused connection and a CSP block all land
+      // here, and the webview reports the last one as a bare `TypeError: Load
+      // failed` — so the message stays about the address rather than guessing.
+      throw new ServerCheckError("unreachable", UNREACHABLE_MESSAGE);
+    } finally {
+      clearTimeout(timer);
+    }
+    // A 5xx is the server's own, or a proxy in front of it saying the app is
+    // down — "check it's online" is the useful thing to say, not "wrong app".
+    if (res.status >= 500) throw new ServerCheckError("unreachable", UNREACHABLE_MESSAGE);
+    if (!res.ok) throw new ServerCheckError("not-baalda", NOT_BAALDA_MESSAGE);
+    const text = await res.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // 200 with HTML: something is there, it just isn't us.
+      throw new ServerCheckError("not-baalda", NOT_BAALDA_MESSAGE);
+    }
+    const ok =
+      !!parsed && typeof parsed === "object" && (parsed as { ok?: unknown }).ok === true;
+    if (!ok) throw new ServerCheckError("not-baalda", NOT_BAALDA_MESSAGE);
+  }
+
   // ---- Auth (Better Auth) -------------------------------------------------
 
   /** Sign up with email+password. Returns the session token to persist. */
@@ -532,14 +727,24 @@ export class ApiClient {
 
   // ---- Google sign-in (social, via desktop loopback) ----------------------
 
-  /** Which sign-in methods the server offers (Google is config-gated). */
-  async getAuthMethods(): Promise<{ emailPassword: boolean; google: boolean }> {
+  /**
+   * Which sign-in methods the server offers (Google, password reset and invite
+   * email are all config-gated).
+   *
+   * Every field beyond `emailPassword` is read with `!!`, so an OLDER server
+   * that answers only `{ emailPassword, google }` reports the new capabilities
+   * as absent — which is the right answer for it, and the reason the UI hides
+   * "Forgot password?" rather than offering a route that silently does nothing.
+   */
+  async getAuthMethods(): Promise<AuthMethods> {
     try {
-      const { data } = await this.request<{ emailPassword: boolean; google: boolean }>(
-        "GET",
-        "/api/auth-methods",
-      );
-      return { emailPassword: data.emailPassword !== false, google: !!data.google };
+      const { data } = await this.request<Partial<AuthMethods>>("GET", "/api/auth-methods");
+      return {
+        emailPassword: data.emailPassword !== false,
+        google: !!data.google,
+        passwordReset: !!data.passwordReset,
+        invitationEmail: !!data.invitationEmail,
+      };
     } catch {
       // Fails CLOSED, and deliberately so: an older/self-hosted server without
       // this endpoint should hide the Google button rather than offer a route
@@ -547,8 +752,52 @@ export class ApiClient {
       // (server down, wrong URL, CSP blocking us) is indistinguishable here from
       // "Google not configured", so a hidden Google button is not proof the
       // server lacks it. Check /api/auth-methods with curl before believing it.
-      return { emailPassword: true, google: false };
+      return {
+        emailPassword: true,
+        google: false,
+        passwordReset: false,
+        invitationEmail: false,
+      };
     }
+  }
+
+  /**
+   * Ask the server to email a password-reset link — and learn what happened.
+   *
+   * Our own route, not Better Auth's `request-password-reset`: that one answers
+   * the same neutral sentence whether the address is unknown, the send failed
+   * or the mail went out. This one resolves only when the provider accepted the
+   * message, and otherwise throws an `ApiError` whose body carries `error`:
+   * `no_account` (404), `send_failed` (502), `too_many_requests` (429) or
+   * `email_not_configured` (400). `lib/resetFlow.ts` turns those into copy.
+   */
+  async requestPasswordReset(email: string): Promise<void> {
+    await this.request<unknown>("POST", "/api/password-reset/request", {
+      body: { email },
+    });
+  }
+
+  /**
+   * Email an invitation's link to its address. Resolves when the provider took
+   * the message; throws `ApiError` with body `error` = `send_failed` (502),
+   * `email_not_configured` (400) or `invitation_not_pending` (410). Called
+   * right after {@link inviteMember} — creating the invitation sends nothing by
+   * itself, precisely so the admin can be told whether the email went out.
+   */
+  async sendInvitationEmail(invitationId: string): Promise<void> {
+    await this.request<unknown>(
+      "POST",
+      `/api/invitations/${encodeURIComponent(invitationId)}/send`,
+    );
+  }
+
+  /** Re-send the sign-up confirmation email for the signed-in address. */
+  async sendVerificationEmail(email: string): Promise<void> {
+    // The server builds its own link and ignores callbackURL, but Better Auth's
+    // schema requires the field.
+    await this.request<unknown>("POST", "/api/auth/send-verification-email", {
+      body: { email, callbackURL: "/email-verified" },
+    });
   }
 
   /**
@@ -664,8 +913,54 @@ export class ApiClient {
     return Array.isArray(data) ? data : (data?.invitations ?? []);
   }
 
-  /** Invitations addressed to the signed-in user (invitee view). */
+  /** Kill a pending invitation (owner/admin). The link stops working at once. */
+  async cancelInvitation(invitationId: string): Promise<void> {
+    await this.request<unknown>("POST", "/api/auth/organization/cancel-invitation", {
+      body: { invitationId },
+    });
+  }
+
+  /**
+   * What an invitation id names — vault, inviter, invited address, status.
+   *
+   * Public on the server (the id is the capability), so this works signed out
+   * and on whatever server the app is currently pointed at. A bearer header
+   * still rides along when we have one; the route ignores it.
+   *
+   * Throws `ApiError` 404 for an id the server doesn't know, which is what the
+   * caller maps to "expired or already used" — an unknown id and a consumed
+   * one must stay indistinguishable.
+   */
+  async previewInvitation(invitationId: string): Promise<InvitationPreview> {
+    const { data } = await this.request<InvitationPreview>(
+      "GET",
+      `/api/invitations/${encodeURIComponent(invitationId)}/preview`,
+    );
+    return data;
+  }
+
+  /**
+   * Invitations addressed to the signed-in user (invitee view).
+   *
+   * Our own `/api/invitations/mine` FIRST, Better Auth's route only as a 404
+   * fallback for an older self-hosted server. Better Auth's
+   * `list-user-invitations` answers 403 for any user whose email isn't
+   * verified — which is every password sign-up — so the in-app invite inbox was
+   * silently empty for exactly the people who most needed it.
+   */
   async listUserInvitations(): Promise<Invitation[]> {
+    try {
+      const { data } = await this.request<{ invitations: Invitation[] } | Invitation[]>(
+        "GET",
+        "/api/invitations/mine",
+      );
+      return Array.isArray(data) ? data : (data?.invitations ?? []);
+    } catch (e) {
+      // Only a missing ROUTE falls back. A 403/500 from our own endpoint is a
+      // real failure and must not be papered over with a call that returns 403
+      // for the same user anyway.
+      if (!(e instanceof ApiError) || e.status !== 404) throw e;
+    }
     const { data } = await this.request<{ invitations: Invitation[] } | Invitation[]>(
       "GET",
       "/api/auth/organization/list-user-invitations",
@@ -712,11 +1007,14 @@ export class ApiClient {
    * cascades members/note-collections/folders/notes/shares and purges the FK-less
    * CRDT stores. Throws ApiError 403 if the caller isn't the owner.
    * (The vault's server identity is the Better Auth organization id.)
+   *
+   * A vault on Pro is cancelled at the provider FIRST, at the period end; if
+   * the provider refuses, nothing is deleted and this throws 502
+   * `subscription_cancel_failed` (#111). On success `subscription` says when
+   * the paid period runs out — until then it can be moved to another vault.
    */
-  async deleteRemoteVault(
-    organizationId: string,
-  ): Promise<{ deleted: boolean; vaults: number; docs: number }> {
-    const { data } = await this.request<{ deleted: boolean; vaults: number; docs: number }>(
+  async deleteRemoteVault(organizationId: string): Promise<VaultDeleteResult> {
+    const { data } = await this.request<VaultDeleteResult>(
       "DELETE",
       `/api/orgs/${encodeURIComponent(organizationId)}`,
     );
@@ -733,6 +1031,20 @@ export class ApiClient {
     await this.request<{ removed: boolean }>(
       "DELETE",
       `/api/orgs/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  /**
+   * Leave a vault you don't own (#121). The server drops the membership, purges
+   * shares granted directly to you, unpins the vault from your sessions and
+   * force-closes your live sync sockets — the same teardown as being removed by
+   * an admin. Throws ApiError 409 `owner_cannot_leave` for the owner (their exit
+   * is deleteRemoteVault) and 404 when you aren't a member.
+   */
+  async leaveVault(organizationId: string): Promise<void> {
+    await this.request<{ left: boolean }>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(organizationId)}/leave`,
     );
   }
 
@@ -867,6 +1179,56 @@ export class ApiClient {
       "POST",
       `/api/billing/orgs/${encodeURIComponent(orgId)}/portal`,
     );
+    return data;
+  }
+
+  /**
+   * Every vault the caller belongs to with its plan/seats/role, plus any
+   * subscription left behind by a deleted vault. One request rather than an
+   * N+1 over {@link getOrgBilling}: the server also reconciles stale rows
+   * against the provider while it is in there.
+   */
+  async getMyBilling(): Promise<MyBilling> {
+    const { data } = await this.request<MyBilling>("GET", "/api/billing/mine");
+    return data;
+  }
+
+  /**
+   * Cancel a vault's subscription (owner only; admins use the portal).
+   * `period_end` keeps the paid time and stops the next charge; `now` revokes
+   * immediately — which is what a subscription from an already-deleted vault
+   * wants, since there is no vault left to spend the rest of the period on.
+   */
+  async cancelSubscription(
+    orgId: string,
+    mode: "period_end" | "now",
+  ): Promise<OrgBilling> {
+    const { data } = await this.request<OrgBilling>(
+      "POST",
+      `/api/billing/orgs/${encodeURIComponent(orgId)}/cancel`,
+      { body: { mode } },
+    );
+    return data;
+  }
+
+  /**
+   * Move a live subscription from one vault to another the caller owns. The
+   * source may be a deleted vault's tombstone, which is the whole point: it
+   * turns "I deleted the wrong vault" into a recoverable mistake instead of a
+   * refund request. Un-cancels at the provider when the source was set to
+   * cancel at the period end.
+   */
+  async transferSubscription(
+    sourceOrgId: string,
+    targetOrgId: string,
+  ): Promise<{ transferred: boolean; orgId: string; billing: OrgBilling }> {
+    const { data } = await this.request<{
+      transferred: boolean;
+      orgId: string;
+      billing: OrgBilling;
+    }>("POST", `/api/billing/orgs/${encodeURIComponent(sourceOrgId)}/transfer`, {
+      body: { targetOrgId },
+    });
     return data;
   }
 

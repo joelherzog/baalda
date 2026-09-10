@@ -205,8 +205,7 @@ button.primary.hero:hover:not(:disabled) {
 .modal input,
 .modal select,
 .account-popover input,
-.account-popover select,
-.server-config-body input {
+.account-popover select {
   background: var(--bg-subtle);
   border: 1px solid transparent;
   color: var(--text-primary);
@@ -233,8 +232,7 @@ button.primary.hero:hover:not(:disabled) {
 .modal input:focus,
 .modal select:focus,
 .account-popover input:focus,
-.account-popover select:focus,
-.server-config-body input:focus {
+.account-popover select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: var(--focus-ring);
@@ -351,12 +349,17 @@ button.primary.hero:hover:not(:disabled) {
   cursor: default;
   user-select: none;
 }
-/* Baalda wordmark image — ink on light theme, silver on dark. */
-.wordmark { display: inline-flex; justify-content: center; }
-.wordmark-img { width: min(42vw, 670px); height: auto; display: block; }
-.wordmark-silver { display: none; }
-[data-theme="dark"] .wordmark-ink { display: none; }
-[data-theme="dark"] .wordmark-silver { display: block; }
+/* Baalda wordmark — ink on light theme, silver on dark. One background image
+   per theme, so the splash fetches only the PNG it actually shows. */
+.wordmark {
+  display: inline-block;
+  width: min(42vw, 670px);
+  aspect-ratio: 1144 / 200;
+  background: url("./assets/baalda-wordmark-ink.png") center / contain no-repeat;
+}
+[data-theme="dark"] .wordmark {
+  background-image: url("./assets/baalda-wordmark-silver.png");
+}
 .vault-actions {
   display: flex;
   flex-direction: column;
@@ -456,20 +459,35 @@ button.primary.hero:hover:not(:disabled) {
   outline: none;
   border-color: var(--accent);
 }
-/* "Open by path" — the picker's escape hatch for what the native folder dialog
-   can't select (a drive root as the vault). Sits under the hint that reveals it. */
+/* "Open by path" modal — rides the shared .modal; only the form layout is ours. */
 .open-by-path {
   display: flex;
-  gap: var(--sp-2);
-  align-items: stretch;
-  justify-content: center;
-  width: min(420px, 84vw);
-  margin: var(--sp-2) auto 0;
+  flex-direction: column;
+  gap: var(--sp-3);
+  text-align: left;
 }
-.open-by-path-input {
-  flex: 1;
-  min-width: 0;
+.open-by-path-hint {
+  margin: 0;
   font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: var(--lh-body);
+}
+.open-by-path-hint code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--bg-hover);
+  padding: 1px var(--sp-1);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+}
+.open-by-path .auth-error {
+  margin: 0;
+}
+.open-by-path-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
 }
 .new-vault-loc {
   font-size: var(--fs-sm);
@@ -848,27 +866,26 @@ body:has(.sidebar-resizer.dragging) {
   font-weight: 600;
   color: var(--text-tertiary);
 }
-/* "Open in file manager" — a quiet companion to the title, not a second
-   focal point, so it only gains colour on hover of the header. */
+/* "Open in file manager" — sits at the end of the path row, always visible
+   but quiet: tertiary until hovered, so it reads as part of the path line
+   rather than a second focal point next to the title. */
 .vault-reveal {
   flex-shrink: 0;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
+  margin-left: auto;
   color: var(--text-tertiary);
-  opacity: 0;
   transition:
     color var(--t-fast) var(--ease),
-    opacity var(--t-fast) var(--ease);
+    background var(--t-fast) var(--ease);
 }
-.vault-reveal svg {
-  width: 15px;
-  height: 15px;
+/* Scoped past the generic `.vault-line svg` (12px) rule below. */
+.vault-line .vault-reveal svg {
+  width: 14px;
+  height: 14px;
 }
-.sidebar-header:hover .vault-reveal,
+.vault-reveal:hover,
 .vault-reveal:focus-visible {
-  opacity: 1;
-}
-.vault-reveal:hover {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
@@ -886,10 +903,14 @@ body:has(.sidebar-resizer.dragging) {
 .vault-line {
   display: flex;
   align-items: center;
-  gap: var(--sp-1);
+  gap: var(--sp-2);
   min-width: 0;
   color: var(--text-tertiary);
   font-size: var(--fs-sm);
+}
+.vault-line .vault-path {
+  flex: 1;
+  min-width: 0;
 }
 .vault-line svg {
   width: 12px;
@@ -1878,7 +1899,7 @@ body:has(.sidebar-resizer.dragging) {
   min-width: 150px;
 }
 /* Portalled to <body>, so it is no longer nested inside whatever opened it and
-   has to out-rank those layers by hand: the settings page is 200 and a modal
+   has to out-rank those layers by hand: the settings modal is 200 and a modal
    backdrop is 300. A popover always belongs above the surface it was opened
    from. */
 .context-menu.menu-portal {
@@ -2820,7 +2841,19 @@ body:has(.sidebar-resizer.dragging) {
   flex-shrink: 0;
   display: inline-flex;
 }
-.identity-avatar-wrap .avatar {
+.identity-avatar-wrap /* Monogram stand-in while the avatar chunk loads. */
+.face-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-subtle);
+  color: var(--text-tertiary);
+  font-weight: 700;
+  font-size: 0.6em;
+  line-height: 1;
+}
+
+.avatar {
   width: 32px;
   height: 32px;
   font-size: var(--fs-sm);
@@ -3177,33 +3210,68 @@ body:has(.sidebar-resizer.dragging) {
 }
 
 /* ---- Auth + members dialogs ---- */
+/* Roomier than the stock 420px `.modal`: the server-choice cards carry an
+   icon tile + two lines each, and the sign-in form has a Google button, a
+   divider and a caption — both breathe better with a little more width. */
+.auth-dialog {
+  width: 468px;
+  padding: var(--sp-8);
+}
+.auth-dialog .modal-header {
+  margin-bottom: var(--sp-6);
+}
 .auth-dialog .segmented {
   margin-bottom: var(--sp-4);
 }
 .auth-dialog .auth-error {
   margin-top: var(--sp-3);
 }
-.auth-dialog .server-config {
-  margin-top: var(--sp-4);
-}
-/* ---- Vault settings — dedicated full page ---- */
-.settings-page {
-  position: fixed;
-  inset: 0;
+/* ---- Account & vault settings — a centered modal over the app ----
+   Both surfaces render through `components/SettingsModal.tsx`: a dimmed
+   `.settings-backdrop` with this card inside it. `.settings-page` stays the
+   class name because input/select styling below is descendant-scoped on it. */
+/* Compound selector on purpose: this element ALSO carries `.modal-backdrop`,
+   whose own z-index (300) is declared later in this file and would win a
+   single-class tie. */
+.modal-backdrop.settings-backdrop {
+  /* Deliberately *below* the generic `.modal-backdrop` (300) so any dialog
+     opened from inside settings — Upgrade, Sign in, Share, a confirm — stacks
+     above this card no matter where it sits in the DOM. Also below the vault
+     setup prompt (`.vault-folder-backdrop`, 210), which the Turn-on-sync card
+     in here can raise. This is the layer the old full-window page occupied. */
   z-index: 200;
+}
+.settings-page {
   background: var(--bg-app);
   display: flex;
   flex-direction: column;
+}
+/* The card. No transform-based animation, on purpose: a transform — even the
+   settled `translateY(0)` that `rise-in`'s `both` fill leaves behind — makes
+   this a containing block and would trap the `position: fixed` dialogs the tab
+   bodies render (the revert-checkpoint confirm in Versioning, for one) inside
+   the card. Opacity only. */
+.settings-page.settings-modal {
+  position: relative;
+  width: min(1200px, 94vw);
+  height: min(860px, 90vh);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
   animation: fade-in var(--t-med) var(--ease) both;
+}
+.settings-page.settings-modal:focus-visible {
+  outline: none;
 }
 .settings-page-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--sp-4);
-  /* The page is fixed over the whole window, so on macOS (title bar overlay)
-     the header must clear the traffic lights floating in the top-left. */
-  padding: calc(var(--sp-5) + var(--titlebar-inset)) var(--sp-8) var(--sp-5);
+  /* No `--titlebar-inset` term: the card is centered in the window and no
+     longer covers the macOS traffic lights it used to have to clear. */
+  padding: var(--sp-5) var(--sp-6);
   border-bottom: 1px solid var(--border);
 }
 .settings-title {
@@ -3230,15 +3298,15 @@ body:has(.sidebar-resizer.dragging) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Fills the card below the header; scrolling happens inside
+   `.settings-content`, never on the card itself. */
 .settings-body {
   flex: 1;
   min-height: 0;
   display: flex;
-  gap: var(--sp-6);
+  gap: var(--sp-5);
   width: 100%;
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: var(--sp-6) var(--sp-8);
+  padding: var(--sp-5) var(--sp-6);
 }
 .settings-nav {
   width: 190px;
@@ -3246,18 +3314,30 @@ body:has(.sidebar-resizer.dragging) {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  /* Vault settings can list ten sections; on a short window the card is
+     `90vh`, so the nav has to scroll rather than be clipped by the card's
+     `overflow: hidden`. */
+  min-height: 0;
+  overflow-y: auto;
 }
 .settings-content {
   flex: 1;
   min-width: 0;
+  /* Hugs its content: a two-line Updates tab gets a short panel, a long
+     Members list grows until it hits the card and then scrolls inside. The
+     card's own height stays fixed so switching tabs never resizes the modal;
+     the area below a short panel is the card's grey ground, not empty white. */
   align-self: flex-start;
   max-height: 100%;
   overflow-y: auto;
   background: var(--bg-surface);
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-sm);
-  padding: var(--sp-6) var(--sp-8) var(--sp-8);
-  animation: rise-in var(--t-fast) var(--ease) both;
+  padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  /* Opacity only — `rise-in` leaves a settled transform behind (its fill mode
+     is `both`), which made this a containing block and trapped the fixed
+     dialogs tab bodies render. See `components/SettingsModal.tsx`. */
+  animation: fade-in var(--t-fast) var(--ease) both;
 }
 /* A team section that isn't available until the vault is synced. Shown
    greyed in the nav (discoverable), with a lock glyph. */
@@ -3359,6 +3439,85 @@ body:has(.sidebar-resizer.dragging) {
 }
 .settings-page .subhead {
   margin: var(--sp-4) 0 var(--sp-2);
+  /* `--text-tertiary` is our "this is off / unavailable" grey — it's what a
+     locked nav item and a disabled control use. On a settings panel these
+     eyebrows are the section HEADINGS, so at tertiary the whole page read as
+     greyed out. Secondary keeps them quieter than body text without looking
+     switched off. The header's `.settings-eyebrow` is a different class and
+     stays tertiary: it labels the card, it doesn't head a section. */
+  color: var(--text-secondary);
+}
+/* Same reasoning for a row's explanatory line (the freeze-root rule, the
+   server-URL caption, the activity-status hints): it carries meaning the
+   reader has to act on, so it can't be painted in the disabled grey. */
+.settings-page .field-hint {
+  color: var(--text-secondary);
+}
+
+/* ── One vertical rhythm for every settings tab ────────────────────────────
+   A `.subhead` is a section LABEL, not a paragraph: it wants a clear gap
+   above (so the eye reads "new section") and almost none below (so it reads
+   as belonging to the list under it). Tabs are written as fragments, so their
+   sections are direct children of `.settings-content` and this one rule
+   spaces all ten of them instead of each tab inventing its own margins.
+
+   Only direct children take part — plus `.versioning-tab`, the one tab that
+   wraps itself in a plain div. A `.subhead` nested inside a card
+   (`.billing-card`, `.mcp-new-token`, `.update-detail`) sits in a FLEX
+   container whose `gap` already spaces it, and a margin there would add to
+   the gap rather than collapse with it. The tab's own `<h2>` already carries
+   the lead-in, so the first subhead after it takes nothing extra. */
+.settings-content > .subhead,
+.settings-content > .versioning-tab > .subhead {
+  margin: var(--sp-8) 0 var(--sp-3);
+}
+.settings-content > .settings-section-title + .subhead,
+.settings-content > .subhead:first-child,
+.settings-content > .versioning-tab > .subhead:first-child {
+  margin-top: 0;
+}
+/* When a hairline draws the break, the hairline IS the section gap: the
+   subhead keeps the separator's own spacing so the line sits centred between
+   the two sections instead of hugging the one below it. */
+.settings-content .menu-sep + .subhead {
+  margin-top: var(--sp-6);
+}
+/* `.menu-sep` is dimensioned for the account popover (4px of air, bleeding
+   8px into that surface's narrower padding). Inside a settings panel it
+   separates two full-width sections, so: symmetric air, no bleed. */
+.settings-content > .menu-sep,
+.settings-content > .versioning-tab > .menu-sep {
+  margin: var(--sp-6) 0;
+}
+/* A section's one-line description sits between its label and its list. The
+   label is already tight against it; the list below needs air. */
+.settings-content > .subhead + .muted,
+.settings-content > .subhead + .billing-section-note,
+.settings-content > .versioning-tab > .subhead + .muted {
+  margin-bottom: var(--sp-3);
+}
+/* A summary row that CLOSES a list ("Free vaults · 3 of 3 used"). Without the
+   rule above it, it reads as one more item in the list it is summarising.
+   Side padding is dropped so its hairline spans the same width as the list's
+   own row dividers. */
+.settings-content .menu-row.settings-footer-row {
+  margin-top: var(--sp-5);
+  padding: var(--sp-4) 0 0;
+  border-top: 1px solid var(--border);
+}
+/* Settings list rows carry a name, up to two pills and up to three actions.
+   At the popover's 4px spacing they read as one paragraph of text, so here
+   each row gets real height and a hairline between rows — one divider style
+   for every list in settings (vaults, members, invitations, subscriptions).
+   The dividers do the separating, so the list drops its own gap. */
+.settings-content .member-list {
+  gap: 0;
+}
+.settings-content .member-list > li {
+  padding: var(--sp-2) 0;
+}
+.settings-content .member-list > li + li {
+  border-top: 1px solid var(--border);
 }
 
 /* Import / Export tab — airy, minimal vertical rhythm. */
@@ -3391,9 +3550,11 @@ body:has(.sidebar-resizer.dragging) {
   gap: var(--sp-2);
   margin: var(--sp-1) 0;
 }
+/* A footnote about what an action will actually do — readable, not greyed.
+   `--fs-xs` is what keeps it under `.io-desc` now that both are secondary. */
 .io-hint {
   margin: 0;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-size: var(--fs-xs);
   line-height: var(--lh-body);
 }
@@ -3462,13 +3623,16 @@ body:has(.sidebar-resizer.dragging) {
   flex-direction: column;
   gap: var(--sp-4);
 }
+/* The Access tab's own eyebrows. Same role as `.subhead`, so the same colour
+   reasoning: tertiary is the disabled grey, and a section heading is not
+   disabled. */
 .access-listlabel,
 .access-seclabel {
   font-size: var(--fs-xs);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-weight: 600;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   margin: 0 0 var(--sp-2);
 }
 
@@ -3701,7 +3865,10 @@ body:has(.sidebar-resizer.dragging) {
   gap: var(--sp-3);
   padding: var(--sp-8) var(--sp-4);
   text-align: center;
-  color: var(--text-tertiary);
+  /* The copy explains why the panel is empty and what to do about it, so it
+     reads at secondary; the glyph below keeps its own tertiary + opacity
+     because that one IS decoration. */
+  color: var(--text-secondary);
 }
 .access-empty p {
   margin: 0;
@@ -4213,45 +4380,222 @@ body:has(.sidebar-resizer.dragging) {
   box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.3));
 }
 
-.server-config {
-  font-size: var(--fs-sm);
-}
-.server-config summary {
-  cursor: pointer;
-  color: var(--text-secondary);
-  list-style: none;
-  padding: var(--sp-1) 0;
-  transition: color var(--t-fast) var(--ease);
-}
-.server-config summary::-webkit-details-marker {
-  display: none;
-}
-.server-config summary::before {
-  content: "⚙";
-  margin-right: var(--sp-2);
-  color: var(--text-tertiary);
-}
-.server-config summary:hover {
-  color: var(--text-primary);
-}
-.server-config-body {
+/* ---- Server choice — the auth dialog's first step (#91) ----
+   The server URL used to be a collapsed <details> "Server settings" at the
+   bottom of this card, which is why self-hosting teams' members kept signing
+   up on the managed instance: it was the only option with any visual weight.
+   The two options here deliberately share one class so neither can read as
+   the default. */
+.server-choice {
   display: flex;
-  gap: var(--sp-2);
-  margin-top: var(--sp-2);
+  flex-direction: column;
+  gap: var(--sp-3);
 }
-.server-config-body button {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  border-radius: var(--radius-pill);
-  padding: var(--sp-2) var(--sp-4);
+.server-choice-lede {
+  margin: 0 0 var(--sp-1);
+  color: var(--text-secondary);
   font-size: var(--fs-sm);
-  font-weight: 500;
-  white-space: nowrap;
-  transition: background var(--t-fast) var(--ease);
+  line-height: var(--lh-body);
 }
-.server-config-body button:hover {
+/* One card = an icon tile, a title + hint, and a trailing chevron. `.server-option`
+   is the card shell (a <button> for managed, a <div> for self-hosted so the URL
+   form can live inside it); `.server-option-head` is the clickable row. */
+.server-option {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: 0;
+  text-align: left;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  transition:
+    background var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease);
+}
+.server-option:hover {
   background: var(--bg-hover);
+  border-color: var(--border);
+}
+.server-option:focus-visible,
+.server-option-head:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.server-option.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.server-option-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-4);
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  border-radius: var(--radius-lg);
+}
+.server-option-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-sm);
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+.server-option:hover .server-option-icon,
+.server-option.active .server-option-icon {
+  color: var(--accent);
+}
+.server-option-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.server-option-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+}
+.server-option-hint {
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-tight);
+}
+.server-option-chevron {
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--text-tertiary);
+  transition:
+    transform var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+.server-option:hover .server-option-chevron {
+  color: var(--text-secondary);
+}
+.server-option.active .server-option-chevron {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+/* The self-hosted card's URL form, revealed inside the card so the input can
+   only read as belonging to that option. */
+.server-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-4) var(--sp-4);
+  animation: fade-in var(--t-med) var(--ease) both;
+}
+.server-option-body input {
+  background: var(--bg-surface);
+  border-color: var(--border);
+  padding: var(--sp-2) var(--sp-3);
+}
+.server-option-body input:hover {
+  border-color: var(--border-strong);
+}
+.server-option-body input:focus {
+  border-color: var(--accent);
+}
+.server-option-body .auth-error {
+  margin: 0;
+}
+.server-connect-row {
+  margin-top: var(--sp-1);
+}
+.server-connect-row .primary {
+  flex: none;
+}
+/* The address an invite link is offering. Wraps rather than truncating: the
+   whole point of this card is that the user can read the URL before saying
+   yes to it. */
+.server-link-url {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+}
+/* Caption under the sign-in form naming the server it is about to post to. */
+.auth-server-note {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin: var(--sp-5) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
+}
+.auth-server-note strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* Why the sign-in card is on screen when a team invitation raised it. */
+.auth-invite-lede {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-3);
+  background: var(--accent-soft);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
+}
+.auth-invite-lede strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* "Forgot password?" — right-aligned under the password field, so it reads as
+   belonging to it rather than as a second submit action. */
+.auth-forgot {
+  display: flex;
+  justify-content: flex-end;
+  margin: calc(-1 * var(--sp-1)) 0 0;
+  font-size: var(--fs-sm);
+}
+.auth-reset-lede {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
+}
+/* The reset form's terminal state: no form left, just what happens next. */
+.auth-reset-done {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
+}
+.auth-reset-done p {
+  margin: 0;
+}
+.auth-reset-done strong {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 /* Members + shares lists */
@@ -4308,11 +4652,70 @@ body:has(.sidebar-resizer.dragging) {
   align-items: center;
   gap: var(--sp-2);
 }
-.invite-row .muted {
+/* Two lines: what you'd be joining, and who asked. Takes the row's spare width
+   so the Accept/Decline buttons keep their intrinsic size. */
+.invite-row-meta {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow: hidden;
+}
+.invite-row-title {
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The old rule this replaces stretched a direct `.muted` child of the row.
+   The row's text now lives in `.invite-row-meta`, a COLUMN — `flex: 1` there
+   would grow the caption vertically instead of taking the row's width. */
+.invite-row-meta .muted {
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+
+/* Confirmation after an invite is created (Members tab). Neutral, not an
+   error — and it holds the link when the server can't send email, which is
+   why it is inline and persistent rather than a toast. */
+.invite-notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
+}
+.invite-notice.is-warning {
+  background: var(--warning-soft);
+}
+.invite-notice-link {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.invite-notice-link code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-1) var(--sp-2);
 }
 
 /* Avatars — circular, deterministic color, initials */
@@ -4477,8 +4880,9 @@ button.sync-badge-retry:hover {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Above the full-screen settings page (z-index 200) so a modal opened from
-     within Settings — e.g. Sign in from the Turn-on-sync card — sits on top. */
+  /* Above the settings modal's own backdrop (`.settings-backdrop`, 200) so a
+     dialog opened from within Settings — Sign in from the Turn-on-sync card,
+     Upgrade, a confirm — sits on top of it regardless of DOM order. */
   z-index: 300;
   animation: fade-in var(--t-med) var(--ease) both;
 }
@@ -4605,9 +5009,49 @@ button.sync-badge-retry:hover {
   flex-shrink: 0;
   white-space: nowrap;
 }
+/* Under the account's vault list: two quiet pill buttons that swap for an
+   inline form (input + primary + cancel) when pressed. */
+/* New vault / Join with code. It closes the vault list above it and opens the
+   next section, so it needs more air above than below. */
 .vault-tab-actions {
-  gap: var(--sp-4);
-  margin-top: var(--sp-2);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-4) 0 var(--sp-2);
+}
+.vault-tab-add {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.vault-tab-add svg {
+  flex: none;
+  color: var(--text-secondary);
+}
+.vault-tab-form {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  max-width: 480px;
+}
+.vault-tab-form input {
+  flex: 1;
+  min-width: 0;
+}
+.vault-tab-form .vault-tab-code {
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.vault-tab-form .vault-tab-code::placeholder {
+  font-family: var(--font-body);
+  letter-spacing: normal;
+  text-transform: none;
+}
+.vault-tab-form .primary,
+.vault-tab-form .ghost-pill {
+  flex: none;
 }
 .vault-root-path {
   flex: 1;
@@ -4765,18 +5209,18 @@ button.sync-badge-retry:hover {
   background: rgba(220, 38, 38, 0.14);
 }
 
-/* "Set up this vault" folder prompt. Sits above the settings page. */
+/* "Set up this vault" folder prompt. Sits above the settings modal (200). */
 .vault-folder-backdrop {
   z-index: 210;
 }
 
 /* The vault setup prompt gets a bespoke, minimal layout rather than the
    generic modal-header/hero-button treatment: an accent folder badge, tight
-   type hierarchy, and two calm buttons (gradient primary + outlined ghost). */
+   type hierarchy, and two calm buttons (gradient primary + filled secondary). */
 .vault-folder-prompt {
   position: relative;
-  width: 400px;
-  padding: var(--sp-6) var(--sp-6) var(--sp-5);
+  width: 440px;
+  padding: var(--sp-8) var(--sp-8) var(--sp-6);
   text-align: center;
   border: 1px solid var(--border);
 }
@@ -4786,8 +5230,8 @@ button.sync-badge-retry:hover {
   right: var(--sp-3);
 }
 .wf-badge {
-  width: 46px;
-  height: 46px;
+  width: 52px;
+  height: 52px;
   margin: 0 auto var(--sp-4);
   display: flex;
   align-items: center;
@@ -4796,8 +5240,12 @@ button.sync-badge-retry:hover {
   background: var(--accent-soft);
   border-radius: var(--radius-lg);
 }
+.wf-badge svg {
+  width: 24px;
+  height: 24px;
+}
 .wf-title {
-  margin: 0 0 var(--sp-2);
+  margin: 0 0 var(--sp-5);
   font-family: var(--font-display);
   font-size: var(--fs-xl);
   font-weight: 600;
@@ -4808,22 +5256,33 @@ button.sync-badge-retry:hover {
   font-weight: 600;
 }
 .wf-desc {
-  margin: 0 auto var(--sp-6);
+  margin: calc(-1 * var(--sp-2)) auto var(--sp-6);
   max-width: 34ch;
   color: var(--text-secondary);
   font-size: var(--fs-md);
   line-height: var(--lh-body);
 }
 /* "Why am I seeing this" callout (folder moved / failed to open): a calm
-   left-aligned well with the folder path typeset on its own line, so a long
-   absolute path doesn't shred the sentence around it. */
+   left-aligned well with a warning glyph and the folder path typeset on its
+   own line, so a long absolute path doesn't shred the sentence around it. */
 .wf-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
   margin: 0 0 var(--sp-6);
   padding: var(--sp-3) var(--sp-4);
   text-align: left;
   background: var(--warning-soft);
-  border: 1px solid var(--border);
   border-radius: var(--radius-md);
+}
+.wf-notice-glyph {
+  flex: none;
+  margin-top: 2px;
+  color: var(--warning);
+}
+.wf-notice-body {
+  flex: 1;
+  min-width: 0;
 }
 .wf-notice p {
   margin: 0;
@@ -4834,6 +5293,9 @@ button.sync-badge-retry:hover {
 .wf-notice code {
   display: block;
   margin-top: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--bg-surface);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--text-secondary);
@@ -4852,8 +5314,9 @@ button.sync-badge-retry:hover {
   width: 100%;
   padding: var(--sp-3) var(--sp-4);
   border: 1px solid transparent;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-pill);
   font: inherit;
+  font-size: var(--fs-md);
   font-weight: 600;
   cursor: pointer;
   transition:
@@ -4861,6 +5324,14 @@ button.sync-badge-retry:hover {
     border-color var(--t-fast) var(--ease),
     transform var(--t-fast) var(--ease),
     box-shadow var(--t-fast) var(--ease);
+}
+/* AsyncButton wraps the children in one inline `.async-btn-label` span, so the
+   button's own flex alignment never reaches the icon — it rode the text
+   baseline. Make the label the flex row instead. */
+.wf-btn .async-btn-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
 }
 .wf-btn svg {
   flex: none;
@@ -4875,21 +5346,20 @@ button.sync-badge-retry:hover {
   box-shadow: var(--shadow-sm);
 }
 .wf-btn-primary:hover:not(:disabled) {
-  transform: translateY(-1px);
+  filter: brightness(1.05);
   box-shadow: var(--shadow-md);
 }
 .wf-btn-primary:active:not(:disabled) {
-  transform: translateY(0);
+  transform: translateY(1px);
   box-shadow: var(--shadow-sm);
 }
 .wf-btn-ghost {
-  background: transparent;
-  color: var(--text-secondary);
-  border-color: var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border-color: var(--border);
 }
 .wf-btn-ghost:hover:not(:disabled) {
-  color: var(--text-primary);
-  background: var(--bg-subtle);
+  background: var(--bg-hover);
   border-color: var(--border-strong);
 }
 .wf-btn-ghost:active:not(:disabled) {
@@ -5069,12 +5539,20 @@ button.secondary:disabled {
 .switch.is-disabled .switch-input {
   cursor: not-allowed;
 }
+/* The OFF track has to read as a control that is off, not as a control that
+   is disabled. `--bg-subtle` over a `--bg-surface` card is almost the same
+   white, and `--border` at 9% alpha didn't draw an edge, so the switch
+   disappeared and only the knob's shadow hinted at it. `--bg-active` is the
+   deepest neutral fill we have and `--border-strong` gives it a real rim; in
+   dark both tokens flip to lighter values against the darker card, so the
+   contrast survives the theme without the track glowing. Disabled stays
+   distinguishable because `.switch.is-disabled` dims the whole control. */
 .switch-track {
   position: absolute;
   inset: 0;
   border-radius: var(--radius-pill);
-  background: var(--bg-subtle);
-  box-shadow: inset 0 0 0 1px var(--border);
+  background: var(--bg-active);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
   transition:
     background var(--t-med) var(--ease),
     box-shadow var(--t-med) var(--ease);
@@ -5087,7 +5565,13 @@ button.secondary:disabled {
   height: 18px;
   border-radius: 50%;
   background: var(--bg-surface);
-  box-shadow: var(--shadow-sm);
+  /* A rim as well as a drop shadow: the knob is `--bg-surface`, and now that
+     the off track is a real fill the two are close together in dark mode
+     (where a shadow alone reads as nothing). The ring is what keeps the thumb
+     visible on the off track AND on the accent one, in both themes. */
+  box-shadow:
+    var(--shadow-sm),
+    inset 0 0 0 1px var(--border-strong);
   /* The knob is what makes the change read as a decision rather than a blink,
      so it gets a slight overshoot on the way across. */
   transition: transform var(--t-med) cubic-bezier(0.34, 1.4, 0.64, 1);
@@ -5168,12 +5652,128 @@ button.secondary:disabled {
   background: var(--bg-active);
   color: var(--text-secondary);
 }
+/* Inside the plan card the card's own `gap` is the rhythm, so the two things
+   that carry their own outer margins for other surfaces (the settings eyebrow,
+   the upgrade dialog's feature list) hand it back here — otherwise their
+   margins ADD to the gap instead of collapsing with it. */
+.billing-card .subhead {
+  margin: var(--sp-2) 0 0;
+}
+.billing-card .upgrade-features {
+  margin: 0;
+}
 .billing-action {
   align-self: flex-start;
   display: inline-flex;
   align-items: center;
   gap: var(--sp-2);
   margin-top: var(--sp-1);
+}
+
+/* ---- Subscriptions list (#109) ----
+   A `.member-list` row that has to carry a second line (renewal, price, seats)
+   under the vault name, so its name cell stops being one ellipsised span.
+   Everything else on the row is the existing pill and action vocabulary.
+
+   This is the list where someone checks what they are paying for, so the row
+   is taller than the settings default and the vault NAME leads it at display
+   size. Pills and actions centre against the two-line block rather than
+   hanging off its first line. */
+.settings-content .member-list > li.billing-sub-row {
+  align-items: center;
+  padding: var(--sp-4) 0;
+}
+.billing-sub-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: var(--text-primary);
+}
+/* The name line: the vault name plus, at most, a "Current" pill. A flex row
+   so the pill keeps its size while the name is the part that ellipsises. */
+.billing-sub-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.billing-sub-vault {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.billing-sub-title .member-role {
+  flex-shrink: 0;
+}
+/* Every fact about the subscription on ONE line, joined with " · ": renewal,
+   price, seats, and who pays when that isn't the reader. Three stacked lines
+   made a row taller than the card above it. */
+.billing-sub-meta {
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+/* Up to three actions plus two pills — more than the vault list carries. Let
+   them wrap rather than squeeze the vault name down to an ellipsis. */
+.billing-sub-row .vault-row-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+/* ---- Transfer dialog ----
+   The destinations ride the upgrade dialog's selectable card, laid out as a
+   row (name left, seats right) inside the confirm dialog's centred body. The
+   list is left-aligned and full width so it reads as a form, not prose. */
+.transfer-targets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: 100%;
+  margin: var(--sp-2) 0;
+  text-align: left;
+}
+.upgrade-plan-card.transfer-target {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  /* Room for the corner check on the right, on every row not just selected. */
+  padding-right: calc(var(--sp-4) + 28px);
+}
+.upgrade-plan-card.transfer-target.selected::after {
+  top: 50%;
+  transform: translateY(-50%);
+}
+.transfer-target-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.transfer-target-meta {
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+.transfer-target.selected .transfer-target-meta {
+  color: var(--accent);
+}
+.confirm-body .transfer-targets-note {
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+}
+/* One line of prose introducing a section's list. */
+.billing-section-note {
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: var(--lh-body);
 }
 
 /* ============================================================
@@ -5550,6 +6150,78 @@ button.is-done:disabled {
   gap: 0;
 }
 
+/* Share menu: the row just copied says so inline (the menu stays open). */
+.share-popover .share-copied {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--success);
+}
+
+/* ---- Confirm dialog (destructive access changes, etc.) ---- */
+.confirm-dialog {
+  width: 440px;
+  padding: var(--sp-8) var(--sp-8) var(--sp-6);
+  text-align: center;
+}
+.confirm-badge {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin: 0 auto var(--sp-4);
+  border-radius: var(--radius-lg);
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.confirm-dialog.tone-accent .confirm-badge {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.confirm-title {
+  margin: 0 0 var(--sp-3);
+  font-family: var(--font-display);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0 auto var(--sp-6);
+  max-width: 38ch;
+  color: var(--text-secondary);
+  font-size: var(--fs-md);
+  line-height: var(--lh-body);
+}
+.confirm-body p {
+  margin: 0;
+}
+.confirm-body strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: center;
+  gap: var(--sp-2);
+}
+.confirm-actions .primary,
+.confirm-actions .ghost-pill {
+  min-width: 128px;
+  padding: var(--sp-3) var(--sp-5);
+  font-size: var(--fs-md);
+}
+.confirm-actions .primary.danger {
+  background: var(--danger);
+}
+.confirm-actions .primary.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 88%, black);
+}
+
 /* ---- Vault switching ---- */
 /* The header renames itself to the destination at once; these two rules are the
    supporting evidence that the rename is a *pending* claim, not a finished one. */
@@ -5581,6 +6253,50 @@ button.is-done:disabled {
   pointer-events: none;
   filter: saturate(0.6);
 }
+/* App-wide switching overlay. Above every modal (300) — Settings is where most
+   switches start — and below the update wall (400). The delayed fade-in means a
+   sub-200ms local switch never shows it at all. */
+.vault-switch-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 350;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--bg-app) 72%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  animation: fade-in var(--t-med) var(--ease) 180ms both;
+}
+.vault-switch-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-5) var(--sp-6);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  animation: rise-in var(--t-med) var(--ease) 180ms both;
+}
+.vault-switch-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.vault-switch-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.vault-switch-title strong {
+  font-weight: 700;
+}
+.vault-switch-sub {
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
 
 /* ---- A row whose note is being opened ---- */
 /* Selection is applied optimistically on click, so the row highlights before
@@ -5602,69 +6318,98 @@ button.is-done:disabled {
   z-index: 400;
   display: grid;
   place-items: center;
-  background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
+  padding: var(--sp-6);
+  background: color-mix(in srgb, var(--bg-app) 82%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  animation: fade-in var(--t-med) var(--ease) both;
 }
 .update-gate-card {
-  position: relative;
-  overflow: hidden;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: var(--sp-4);
-  max-width: 440px;
-  padding: var(--sp-9, 44px) var(--sp-8) var(--sp-8);
+  width: min(420px, 100%);
+  padding: var(--sp-8) var(--sp-8) var(--sp-6);
   text-align: center;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
   box-shadow: var(--shadow-lg);
+  animation: rise-in var(--t-med) var(--ease) both;
 }
-/* A thin accent thread across the top — enough identity without a logo. */
-.update-gate-card::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 3px;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-}
-.update-gate-version {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+/* Accent tile with a download arrow — the one graphic on the card; no logo. */
+.update-gate-badge {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
   color: var(--accent);
   background: var(--accent-soft);
-  padding: 3px 12px;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-lg);
+}
+.update-gate-heading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
 }
 .update-gate-card h1 {
   margin: 0;
+  font-family: var(--font-display);
   font-size: var(--fs-xl);
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+.update-gate-version {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
 }
 .update-gate-card p {
   margin: 0;
   color: var(--text-secondary);
-  line-height: 1.55;
-  max-width: 36ch;
+  font-size: var(--fs-md);
+  line-height: var(--lh-body);
+  max-width: 34ch;
+}
+.update-gate-card p strong {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 .update-gate-actions {
   display: flex;
-  align-items: center;
-  gap: var(--sp-3);
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  width: 100%;
   margin-top: var(--sp-2);
 }
 .update-gate-cta {
-  min-width: 160px;
+  width: 100%;
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-md);
+}
+/* Reload is the escape hatch, not a peer of Install: a quiet text button. */
+.update-gate-actions .ghost-pill {
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+.update-gate-actions .ghost-pill:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-subtle);
 }
 .update-gate .update-progress {
-  width: 240px;
+  width: 100%;
+  max-width: 260px;
   flex: none;
+  margin-top: var(--sp-1);
 }
 
 /* ---- Update download progress ---- */
@@ -5675,7 +6420,7 @@ button.is-done:disabled {
   max-width: 240px;
   height: 4px;
   border-radius: var(--radius-pill);
-  background: color-mix(in srgb, var(--text-primary) 12%, transparent);
+  background: var(--accent-soft);
   overflow: hidden;
 }
 .update-progress-fill {

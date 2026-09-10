@@ -47,6 +47,8 @@ class FakeDisk {
   /** relPath → body, for the emptiness check on unconfirmed notes. */
   bodies = new Map<string, string>();
   trashed: Array<{ from: string; to: string }> = [];
+  /** Paths removed outright (revocations) — never in the trash. */
+  deleted: string[] = [];
 
   tree(): TreeNode {
     const dirs = [...this.folders].map((f) => ({
@@ -84,7 +86,9 @@ function install(disk: FakeDisk) {
   vi.mocked(ipc.readNote).mockImplementation((async (p: string) =>
     disk.bodies.get(p) ?? "") as never);
   vi.mocked(ipc.ensureFolder).mockImplementation((async (p: string) => {
+    if (disk.folders.has(p)) return false; // already there — not a disk change
     disk.folders.add(p);
+    return true;
   }) as never);
   vi.mocked(ipc.writeNoteIfMissing).mockImplementation((async (p: string) => {
     if (disk.notes.has(p)) return false;
@@ -105,7 +109,7 @@ function install(disk: FakeDisk) {
     return to;
   }) as never);
   vi.mocked(ipc.deleteFolderIfEmpty).mockImplementation((async (p: string) => {
-    if (!disk.folders.has(p)) return true; // already gone — the goal state
+    if (!disk.folders.has(p)) return false; // already gone — nothing removed
     const prefix = p + "/";
     const occupied =
       [...disk.notes.keys()].some((n) => n.startsWith(prefix)) ||
@@ -113,6 +117,12 @@ function install(disk: FakeDisk) {
     if (occupied) return false;
     disk.folders.delete(p);
     return true;
+  }) as never);
+  vi.mocked(ipc.deletePath).mockImplementation((async (p: string) => {
+    if (!disk.notes.has(p)) throw new Error("path does not exist");
+    disk.notes.delete(p);
+    disk.bodies.delete(p);
+    disk.deleted.push(p);
   }) as never);
   vi.mocked(ipc.trashNote).mockImplementation((async (p: string, stamp: string) => {
     if (!disk.notes.has(p)) throw new Error("path does not exist");
@@ -158,15 +168,23 @@ function fakeApi(state: ServerState) {
 function recordingHost() {
   const released: string[] = [];
   const renamed: Array<{ from: string; to: string }> = [];
-  const removed: Array<{ path: string; trashedTo: string | null }> = [];
+  const removed: Array<{ path: string; trashedTo: string | null; reason: string }> = [];
+  /** Paths the registry asked to fill in from a local CRDT after materializing.
+   *  This host has no doc store, so it answers "nothing to fill in" — which is
+   *  the fresh-device case, i.e. today's empty placeholder. */
+  const hydrated: Array<{ docId: string; path: string }> = [];
   const host: InboundHost = {
     releaseDoc: async (docId) => {
       released.push(docId);
     },
     notePathChanged: (_docId, from, to) => renamed.push({ from, to }),
-    noteRemoved: (_docId, path, trashedTo) => removed.push({ path, trashedTo }),
+    noteRemoved: (_docId, path, trashedTo, reason) => removed.push({ path, trashedTo, reason }),
+    materializeContent: async (docId, path) => {
+      hydrated.push({ docId, path });
+      return false;
+    },
   };
-  return { host, released, renamed, removed };
+  return { host, released, renamed, removed, hydrated };
 }
 
 /**
@@ -394,11 +412,13 @@ describe("inbound delete", () => {
     expect(ipc.trashNote).not.toHaveBeenCalled();
   });
 
-  it("REMOVES a file whose access was revoked, and stops re-registering it", async () => {
+  it("REMOVES a file whose access was revoked outright, and stops re-registering it", async () => {
     // `GET /api/notes` is ACL-filtered, so a revoked share looks like a delete;
-    // the tombstone set is what tells them apart. Both end with the file in the
-    // vault's recoverable trash — a revocation that leaves a readable `.md`
-    // behind is cosmetic, since the ex-reader can open it in any editor forever.
+    // the tombstone set is what tells them apart. A DELETED note goes to the
+    // vault trash (the undo for a deliberate removal); a REVOKED one is removed
+    // outright — a copy in `.context/trash` would hand the ex-reader exactly the
+    // readable `.md` the revocation exists to take away, and the server still
+    // holds the content, so nothing is lost.
     const disk = new FakeDisk();
     disk.notes.set("shared.md", "d1");
     const r = await twoPasses({
@@ -408,7 +428,11 @@ describe("inbound delete", () => {
     });
 
     expect(disk.notes.has("shared.md")).toBe(false);
-    expect(ipc.trashNote).toHaveBeenCalledWith("shared.md", expect.any(String), null);
+    expect(disk.deleted).toEqual(["shared.md"]);
+    expect(disk.trashed).toEqual([]);
+    expect(ipc.trashNote).not.toHaveBeenCalled();
+    // The UI learns WHY, so it can say "access removed" rather than "deleted".
+    expect(r.removed).toEqual([{ path: "shared.md", trashedTo: null, reason: "revoked" }]);
     // And it is NOT re-registered on the way out, which would resurrect it as an
     // unsyncable ghost.
     expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
@@ -528,6 +552,51 @@ describe("inbound folder deletion", () => {
     expect(vi.mocked(api.createFolder)).toHaveBeenCalledWith(
       expect.objectContaining({ path: "Team" }),
     );
+  });
+
+  it("removes a folder made private along with its notes, and does not re-adopt it", async () => {
+    // The reported bug: the Access page set "Getting Started" to Private. On the
+    // teammate's device the notes left as revoked, but the folder — neither
+    // tombstoned nor moved, merely absent from the permission-filtered listing —
+    // stayed in the sidebar as an empty shell, and the outbound half re-adopted
+    // its hidden id on every pull.
+    const disk = new FakeDisk();
+    disk.folders.add("Getting Started");
+    disk.notes.set("Getting Started/welcome.md", "d1");
+    const { api } = await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Getting Started/welcome.md" }],
+        folders: [{ id: "f1", path: "Getting Started" }],
+      },
+      // Nothing deleted: both tombstone lists are answered and empty.
+      then: { notes: [], tombstones: [], folders: [], folderTombstones: [] },
+    });
+
+    expect(disk.deleted).toEqual(["Getting Started/welcome.md"]);
+    expect(disk.trashed).toEqual([]);
+    expect(disk.folders.has("Getting Started")).toBe(false);
+    expect(vi.mocked(api.createFolder)).not.toHaveBeenCalled();
+  });
+
+  it("keeps a private folder that still holds unconfirmed content", async () => {
+    // Access can be taken away mid-edit. The note pass refuses to trash work this
+    // device never confirmed upstream, and the folder around it must then stay too.
+    const disk = new FakeDisk();
+    disk.folders.add("Getting Started");
+    disk.notes.set("Getting Started/mine.md", "d1");
+    disk.bodies.set("Getting Started/mine.md", "words nobody else has");
+    await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Getting Started/mine.md" }],
+        folders: [{ id: "f1", path: "Getting Started" }],
+      },
+      then: { notes: [], tombstones: [], folders: [], folderTombstones: [] },
+    });
+
+    expect(disk.trashed).toEqual([]);
+    expect(disk.folders.has("Getting Started")).toBe(true);
   });
 
   it("removes the emptied old directory after a server-side folder move, and does not re-register it", async () => {

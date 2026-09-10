@@ -81,6 +81,9 @@ export interface VaultChannelDeps {
  *  ~1,100 per-subscriber ACL recomputes) and a handful. */
 export const REGISTRY_COALESCE_MS = 120;
 
+/** Most docs one `ready.behind` names — the same bound `ready.empty` uses. */
+export const BEHIND_CAP = 2000;
+
 export class VaultChannel {
   private readonly pubsub: PubSub;
   private readonly listReadableDocs: typeof listReadableDocsInVault;
@@ -471,12 +474,18 @@ class VaultConnection {
     } catch (err) {
       console.error("Vault channel empty-doc probe failed:", err);
     }
+    // Docs the backfill found this client AHEAD on — it holds ops the server has
+    // never received. Named so the client pushes them; the feed itself cannot.
+    const behind = this.behind;
+    const behindTruncated = this.behindTruncated;
     this.send({
       t: "ready",
       // Omitted when nothing is empty, so the common frame is byte-identical to
       // what every shipped client already parses.
       ...(empty.length > 0 ? { empty } : {}),
       ...(empty.length > 0 && emptyTruncated ? { emptyTruncated: true as const } : {}),
+      ...(behind.length > 0 ? { behind } : {}),
+      ...(behind.length > 0 && behindTruncated ? { behindTruncated: true as const } : {}),
     });
   }
 
@@ -588,8 +597,19 @@ class VaultConnection {
     return true;
   }
 
+  /**
+   * Docs whose backfill found the CLIENT ahead of the server (see
+   * `DocDiff.clientAhead`), collected during {@link backfill} and named on the
+   * `ready` that terminates it. Capped like `ready.empty`: one frame must stay
+   * bounded however large the vault.
+   */
+  private behind: string[] = [];
+  private behindTruncated = false;
+
   /** Stream missing ops for every readable doc, priority docs first. */
   private async backfill(manifest: Record<string, string>, priority: string[]): Promise<void> {
+    this.behind = [];
+    this.behindTruncated = false;
     const prioritized = priority.filter((d) => this.readable.has(d));
     const prioritySet = new Set(prioritized);
     const rest = [...this.readable].filter((d) => !prioritySet.has(d));
@@ -617,6 +637,10 @@ class VaultConnection {
       console.error(`Vault channel backfill failed for ${docId}:`, err);
       return;
     }
+    if (diff?.clientAhead) {
+      if (this.behind.length < BEHIND_CAP) this.behind.push(docId);
+      else this.behindTruncated = true;
+    }
     if (!diff || diff.upToDate) return; // nothing new for this client
     this.sendBinary(encodeWsUpdate(docId, diff.update));
   }
@@ -638,7 +662,17 @@ class VaultConnection {
       // every teammate edit to that note until the next reconnect. Coalescing
       // (see `publishRegistryChanged`) is what makes this cheap — a 500-note
       // reconcile costs a handful of recomputes, not ~1,100.
-      void this.refreshAcl();
+      //
+      // `if-changed` is what keeps a structural change from being announced as an
+      // ACL change. A create/rename/move/delete can add or remove docs, and those
+      // cases DO need `reauth`; what it never does is flip a permission on a doc
+      // the client can already see. Sending `reauth` unconditionally made every
+      // structural write cost every subscriber — the author included, since this
+      // branch has no origin skip — a token re-mint (which tears the open note's
+      // provider down and back up) plus a full registry pull, whose own writes
+      // then published the next `registry-changed`. On a vault with work left to
+      // do that never settled: the badge blinked Syncing/Synced indefinitely (#93).
+      void this.refreshAcl({ reauth: "if-changed" });
       // Self-exclusion applies to the re-pull only. This client already holds the
       // ids the API returned it, so asking it to re-pull its own writes is a
       // wasted round trip (listFolders + listNotes + a full client syncStructure).
@@ -716,7 +750,7 @@ class VaultConnection {
     void this.refreshAcl();
   }
 
-  private async refreshAcl(): Promise<void> {
+  private async refreshAcl(opts: { reauth?: "always" | "if-changed" } = {}): Promise<void> {
     if (!this.userId || !this.vaultId) return;
     let next: Set<string>;
     try {
@@ -727,17 +761,27 @@ class VaultConnection {
     }
     const prev = this.readable;
     this.readable = next;
+    let lost = 0;
     for (const docId of prev) {
-      if (!next.has(docId)) this.send({ t: "drop", docId }); // access lost
+      if (!next.has(docId)) {
+        this.send({ t: "drop", docId }); // access lost
+        lost++;
+      }
     }
+    const added = [...next].filter((d) => !prev.has(d));
     // The set of readable docs only shifts on add/remove — but a view↔edit change
     // (or a lock) leaves the set intact while flipping the OPEN note's editability.
     // The open note syncs over its own Hocuspocus socket, not this feed, so tell
     // the client to re-mint that doc's sync token; it reconnects read-only/edit to
-    // match. Sent on every ACL change (this channel is always-on) so downgrades and
-    // unlocks both reach open editors in realtime without a reopen (spec 04 §4).
-    this.send({ t: "reauth" });
-    const added = [...next].filter((d) => !prev.has(d));
+    // match. Sent on every genuine ACL change (this channel is always-on) so
+    // downgrades and unlocks both reach open editors in realtime without a reopen
+    // (spec 04 §4) — `always` is therefore the default, and only the structural
+    // caller opts out with `if-changed`, which still re-mints whenever the set
+    // actually moved. A re-mint the client does not need is not free: it drops and
+    // reopens the open note's socket.
+    if ((opts.reauth ?? "always") === "always" || added.length > 0 || lost > 0) {
+      this.send({ t: "reauth" });
+    }
     if (added.length > 0 && this.vaultId) {
       // We can now see docs we couldn't before — ask the vault to re-announce
       // presence so viewers of the newly-readable docs light up for us.
@@ -902,6 +946,11 @@ class VaultConnection {
   private abort(reason: string): void {
     if (this.closed) return;
     this.lastAbortReason = reason;
+    // Force-closes are rare and always worth a line: a client stuck in a
+    // reconnect loop is otherwise invisible from the server side.
+    console.warn(
+      `[vault-channel] aborting user=${this.userId ?? "?"} vault=${this.vaultId ?? "?"}: ${reason}`,
+    );
     try {
       if (typeof this.ws.terminate === "function") this.ws.terminate();
       else this.ws.close();
@@ -941,6 +990,9 @@ class VaultConnection {
   }
 
   private fail(message: string): void {
+    console.warn(
+      `[vault-channel] refusing user=${this.userId ?? "?"} vault=${this.vaultId ?? "?"}: ${message}`,
+    );
     this.send({ t: "err", message });
     this.ws.close();
     this.cleanup();

@@ -34,6 +34,7 @@ import {
 } from "../api";
 import * as ipc from "../ipc";
 import type { TreeNode } from "../ipc";
+import * as perf from "../perf";
 import { seedWelcomeContent } from "../vault/seed";
 import { Checkpointer, checkpointBatchFor } from "./checkpoint";
 import { planInbound } from "./inbound";
@@ -137,8 +138,35 @@ export interface InboundHost {
   releaseDoc(docId: string): Promise<void>;
   /** The file moved: re-point anything showing it (e.g. the open editor). */
   notePathChanged(docId: string, from: string, to: string): void;
-  /** The file is gone: close anything showing it. */
-  noteRemoved(docId: string, path: string, trashedTo: string | null): void;
+  /**
+   * The file is gone: close anything showing it. `trashedTo` is the vault-trash
+   * path for a `deleted` note; a `revoked` note is removed outright (the server
+   * still holds it, and an ex-reader must not keep a readable copy), so it is
+   * `null`.
+   */
+  noteRemoved(
+    docId: string,
+    path: string,
+    trashedTo: string | null,
+    reason: "deleted" | "revoked",
+  ): void;
+  /**
+   * A server-only note was just materialized as a 0-byte placeholder at `path`.
+   * Fill it in from THIS DEVICE's local CRDT, if it has one, and resolve whether
+   * it did.
+   *
+   * The registry cannot do this itself: the content lives in a Y.Doc, and only
+   * the session owns bridges. Best-effort by contract — false leaves today's
+   * empty placeholder, which hydrates lazily on open (a fresh device has nothing
+   * to fill it with anyway).
+   *
+   * It matters because the placeholder is a real file write, so the watcher
+   * reports it and the local-change push diff-merges it into the note's CRDT. On
+   * a device that already holds the note, that merge was a delete-all — and it
+   * was pushed (#93). Writing the content the device already has removes the
+   * trigger instead of guarding against it.
+   */
+  materializeContent(docId: string, path: string): Promise<boolean>;
 }
 
 export interface ReconcileInput {
@@ -267,6 +295,18 @@ export class VaultRegistry {
   private host: InboundHost | null = null;
   /** Local note paths the current pass must not re-register (see `InboundPlan.suppress`). */
   private inboundSuppressed = new Set<string>();
+  /**
+   * Paths THIS device just created as materialized placeholders, awaiting their
+   * own watcher echo (see {@link consumeMaterialized}).
+   *
+   * `writeNoteIfMissing` is a real atomic write, so the watcher reports the file
+   * ~150ms later as `modified` for a path the registry maps — indistinguishable,
+   * from the sync layer's side, from an AI having just written it. Queuing a
+   * content push for it is how a 0-byte placeholder came to be diff-merged into a
+   * populated doc as a delete-all (#93). One entry is consumed per path by the
+   * first event that arrives for it.
+   */
+  private materialized = new Set<string>();
   /** Everything that could not be registered in the last run. */
   private failed: RegistryFailure[] = [];
   /** Set when the server refused on a plan limit: the rest of the run is
@@ -294,6 +334,13 @@ export class VaultRegistry {
    * can't snapshot the vault we left and write it into the one we just opened.
    */
   private checkpoint: Checkpointer<VaultSyncConfig> | null = null;
+
+  /**
+   * The config `primeLocal` parsed, held for the `reconcile` that follows it.
+   * One read of a file that is ~1.85 MB on a 6k-note vault, per boot, shared by
+   * both — instead of one apiece.
+   */
+  private primedConfig: VaultSyncConfig | null = null;
 
   /**
    * Notified whenever the {relPath → docId} map changes.
@@ -475,6 +522,7 @@ export class VaultRegistry {
     // Synchronously first: a pending flush must never outlive the vault.
     this.checkpoint?.dispose();
     this.checkpoint = null;
+    this.primedConfig = null;
     this.serverVaultId = null;
     this.organizationId = null;
     this.byPath.clear();
@@ -488,6 +536,9 @@ export class VaultRegistry {
     this.baselineVaultId = null;
     this.failed = [];
     this.limitReached = null;
+    // Paths, so they belong to the vault we are leaving — and a stale entry would
+    // suppress the next vault's first watcher event for the same relative path.
+    this.materialized.clear();
     this.bound = null;
     this.progress = nullProgressSink;
   }
@@ -524,6 +575,25 @@ export class VaultRegistry {
   /** Vault-relative path for a docId, if mapped (reverse of getMapping). */
   pathForDocId(docId: string): string | null {
     return this.byDocId.get(docId) ?? null;
+  }
+
+  /**
+   * Was `relPath` created by this device's own materialize step, and is its
+   * watcher echo still owed? Consumes the entry, so the SECOND event for the
+   * path (a real external edit) is treated normally.
+   */
+  consumeMaterialized(relPath: string): boolean {
+    return this.materialized.delete(relPath);
+  }
+
+  /** Record a placeholder this pass created (see {@link materialized}). */
+  private markMaterialized(relPath: string): void {
+    // Bounded: an echo that never arrives (the write was outside the watcher's
+    // window, the vault was closed) would otherwise pin the entry forever. A
+    // vault's worth of placeholders is the natural high-water mark, so a set an
+    // order of magnitude past that is stale by definition.
+    if (this.materialized.size > 20_000) this.materialized.clear();
+    this.materialized.add(relPath);
   }
 
   /** All mapped doc ids (for the vault sync engine's initial doc set). */
@@ -617,7 +687,15 @@ export class VaultRegistry {
     return this.limitReached;
   }
 
-  private recordFailure(f: RegistryFailure): void {
+  /**
+   * Record something that could not be synced.
+   *
+   * Public because the session records failures too: a batch of disk deletes the
+   * blast-radius cap refused (`SyncManager.drainDiskDeletes`) has to reach the
+   * same "N items not synced" surface as a failed create, or a refusal that
+   * protected the user's notes would be invisible to them.
+   */
+  recordFailure(f: RegistryFailure): void {
     this.failed.push(f);
     if (f.code === "vault_limit_reached" || f.code === "member_limit_reached") {
       this.limitReached = f.code;
@@ -693,7 +771,10 @@ export class VaultRegistry {
     args: {
       folders: TreeNode[];
       notes: TreeNode[];
-      titles: Array<{ path: string; id: string }>;
+      /** The index's {path → docId} rows, READ ON DEMAND: they are needed only
+       *  for on-disk notes this registry doesn't already map, and the read parks
+       *  on the index write lock (see the thunk in `syncStructure`). */
+      titles: () => Promise<Array<{ path: string; id: string }>>;
       serverFolders: Array<{ id: string; path: string }>;
       serverNotes: RegisteredNote[];
       tombstones: string[] | null;
@@ -743,8 +824,14 @@ export class VaultRegistry {
     // Only notes that are BOTH in the tree and in the index have a docId we can
     // match on. (The index covers `.md`; a `.txt`/`.canvas` note therefore never
     // gets inbound-renamed or trashed, only materialized — the safe direction.)
-    for (const t of args.titles) {
-      if (localNotePaths.has(t.path) && !claimed.has(t.path)) local.set(t.id, t.path);
+    //
+    // Asked for only when some on-disk note is NOT claimed above: on a
+    // steady-state relaunch the registry's own map covers every one of them, so
+    // this loop has nothing to add and the index read is pure launch latency.
+    if ([...localNotePaths].some((p) => !claimed.has(p))) {
+      for (const t of await args.titles()) {
+        if (localNotePaths.has(t.path) && !claimed.has(t.path)) local.set(t.id, t.path);
+      }
     }
     const server = new Map<string, string>();
     for (const n of args.serverNotes) {
@@ -784,8 +871,13 @@ export class VaultRegistry {
     for (const path of plan.createFolders) {
       if (this.stopRun()) break;
       try {
-        await ipc.ensureFolder(path, this.epoch());
-        changedDisk = true;
+        // Only a directory this call actually created is a disk change — and it
+        // is OUR change, so its watcher echo is remembered and consumed rather
+        // than read as an external edit that needs another pull (#98).
+        if (await ipc.ensureFolder(path, this.epoch())) {
+          changedDisk = true;
+          this.markMaterialized(path);
+        }
       } catch (e) {
         if (ipc.isVaultMismatch(e)) return none;
         this.recordFailure({
@@ -861,12 +953,24 @@ export class VaultRegistry {
       await this.host?.releaseDoc(gone.docId);
       if (this.stale()) return { changedDisk, suppress: plan.suppress };
       try {
-        const dest = await ipc.trashNote(gone.path, stamp, this.epoch());
+        // A DELETED note goes to the vault's recoverable trash: someone chose to
+        // remove it, and the trash is the undo. A REVOKED note is removed
+        // outright: nothing was deleted (the server still holds every byte, and
+        // the note comes straight back if access is restored), while a copy in
+        // `.context/trash` would leave the ex-reader with exactly the readable
+        // `.md` the revocation exists to take away. `deletePath` is the same
+        // epoch-pinned Rust call the sidebar's own Delete uses.
+        let dest: string | null = null;
+        if (gone.reason === "revoked") {
+          await ipc.deletePath(gone.path, this.epoch());
+        } else {
+          dest = await ipc.trashNote(gone.path, stamp, this.epoch());
+        }
         changedDisk = true;
         // The file left, so the baseline entry goes with it — otherwise every
-        // later pass would keep trying to trash a path that isn't there.
+        // later pass would keep trying to remove a path that isn't there.
         this.baselineDocs.delete(gone.docId);
-        this.host?.noteRemoved(gone.docId, gone.path, dest);
+        this.host?.noteRemoved(gone.docId, gone.path, dest, gone.reason);
       } catch (e) {
         if (ipc.isVaultMismatch(e)) return { changedDisk, suppress: plan.suppress };
         this.recordFailure({
@@ -944,17 +1048,22 @@ export class VaultRegistry {
       }
     }
 
-    // Folders the server has deleted, children before parents, AFTER the trash
-    // loop above has moved their notes out. Empty-only removal (`remove_dir`,
-    // never recursive): a folder still holding anything stays on disk and — its
-    // dead mapping dropped below — re-registers under a fresh id, because
-    // content must live somewhere. Either way the stale id leaves the map, so
-    // nothing can later rename/color/re-register against a deleted server row.
+    // Folders the server has deleted, moved away from, or taken this user's
+    // access to (made private: absent from the permission-filtered listing with
+    // no tombstone), children before parents, AFTER the trash loop above has
+    // moved their notes out. Empty-only removal (`remove_dir`, never recursive):
+    // a folder still holding anything stays on disk and — its dead mapping
+    // dropped below — re-registers under a fresh id, because content must live
+    // somewhere. Either way the stale id leaves the map, so nothing can later
+    // rename/color/re-register against a deleted server row.
     for (const path of plan.removeFolders) {
       if (this.stopRun()) break;
       try {
         const removed = await ipc.deleteFolderIfEmpty(path, this.epoch());
-        if (removed) changedDisk = true;
+        if (removed) {
+          changedDisk = true;
+          this.markMaterialized(path); // our removal; one watcher echo to swallow
+        }
       } catch (e) {
         if (ipc.isVaultMismatch(e)) return { changedDisk, suppress: plan.suppress };
         this.recordFailure({
@@ -1064,22 +1173,80 @@ export class VaultRegistry {
    * Returns `{ seeded }` — true only when this call wrote first-run starter
    * content into a brand-new, empty vault (so the caller can open it).
    */
+  /**
+   * Adopt this folder's OWN doc-id map from `.context/config.json`, with no
+   * server round trip — so a note this device already maps can open with a
+   * provider (pull-before-seed, spec 03 §5) while `reconcile` is still running.
+   *
+   * Provisional by construction: the collection id comes from disk, and
+   * `reconcile` re-validates it against `listVaults` a moment later. A mismatch
+   * drops these mappings in `syncStructure`'s different-collection prune,
+   * exactly as it drops a stale map today.
+   *
+   * REQUIRES the config to carry the `organizationId` stamp, and for it to
+   * match: a pre-stamp config proves nothing about whose folder this is, and
+   * priming a foreign one is the cross-vault merge every guard in this file
+   * exists to stop. Such a folder simply doesn't prime — the reconcile then
+   * adopts it the slow, verified way, which is today's behaviour.
+   *
+   * Returns whether anything was adopted.
+   */
+  async primeLocal(orgId: string): Promise<boolean> {
+    this.bound = this.scopes.current();
+    const cfg = await this.loadConfig();
+    if (this.stale()) return false;
+    if (!cfg.organizationId || cfg.organizationId !== orgId) return false;
+    if (!cfg.serverVaultId) return false;
+    // Handed to `reconcile` so the file is read once per boot, not twice.
+    this.primedConfig = cfg;
+    this.organizationId = orgId;
+    this.serverVaultId = cfg.serverVaultId;
+    // The layers above read the collection id off the scope.
+    if (this.bound) this.bound.serverVaultId = cfg.serverVaultId;
+    // So a `markPushed` for a note opened during the window is persisted rather
+    // than dropped (`reconcile` adopts this same checkpointer).
+    this.newCheckpointer();
+    for (const [rp, docId] of Object.entries(cfg.docs ?? {})) {
+      if (typeof docId === "string" && docId) this.setMapping(rp, docId, cfg.serverVaultId);
+    }
+    for (const [rp, id] of Object.entries(cfg.folders ?? {})) {
+      if (typeof id === "string" && id) this.folderByPath.set(rp, id);
+    }
+    this.pushed = new Set(cfg.pushed ?? []);
+    // Same collection guard as `reconcile`'s: the baseline describes the
+    // collection the config names, which is the one we just adopted.
+    this.baselineDocs = new Map<string, string>();
+    for (const [docId, rp] of Object.entries(cfg.baseline ?? {})) {
+      if (typeof rp === "string" && rp) this.baselineDocs.set(docId, rp);
+    }
+    this.baselineVaultId = cfg.serverVaultId;
+    return true;
+  }
+
   async reconcile(input: ReconcileInput): Promise<{ seeded: boolean }> {
     // Bind this registry to the vault the reconcile is FOR — this is the one
     // operation allowed to (re)claim it. Every await below is a chance for the
     // user to switch vaults; each `stale()` checkpoint drops the rest of the work
     // instead of applying it to whatever vault is now open.
-    this.bound = this.scopes.current();
+    // `primeLocal` may have claimed the same scope moments ago; keep that claim
+    // while it is still current rather than re-reading it.
+    if (!this.bound || !this.bound.isCurrent()) this.bound = this.scopes.current();
     this.organizationId = input.organizationId;
     this.failed = [];
     this.limitReached = null;
-    this.newCheckpointer();
+    // NOT unconditional: `newCheckpointer` disposes the previous one, and after
+    // a prime that one may hold a `markPushed` for a note the user opened during
+    // the window — dropping it loses a real fact about the server.
+    this.checkpoint ?? this.newCheckpointer();
     this.sink.phase("registering", 0);
     // Epoch-pinned like every other read here: a vault switch mid-walk makes Rust
     // reject it, which `stale()` then turns into a clean drop.
     const tree = await this.readFullTree();
     if (this.stale()) return { seeded: false };
-    const cfg = await this.loadConfig();
+    // The prime already parsed it (one read per boot); it is consumed here so a
+    // later pull re-reads from disk as before.
+    const cfg = this.primedConfig ?? (await this.loadConfig());
+    this.primedConfig = null;
     if (this.stale()) return { seeded: false };
     this.tuneCheckpointBatch(Object.keys(cfg.docs ?? {}).length);
 
@@ -1132,7 +1299,16 @@ export class VaultRegistry {
     // killed backfill resume instead of re-walking the whole vault. Guarded on
     // the collection matching, like everything else read back from config: a
     // pushed-set recorded against another collection says nothing about this one.
-    this.pushed = new Set(cfg.serverVaultId === vaultId ? (cfg.pushed ?? []) : []);
+    //
+    // The in-memory set is folded in, not replaced: a note opened during the
+    // PRIME window can be confirmed (`confirmOpenDoc` → `markPushed`) before
+    // this line runs, and that is a real fact about the server. Overwriting it
+    // from the file would send the doc back through the content run for nothing.
+    // Both halves still die together when the collection doesn't match.
+    this.pushed =
+      cfg.serverVaultId === vaultId
+        ? new Set([...(cfg.pushed ?? []), ...this.pushed])
+        : new Set();
     // Adopt the baseline ONLY if the config we just read describes the collection
     // we actually resolved. Anything else (a first run, a config from another
     // vault, a rewritten `.context`) leaves it empty, which disables inbound for
@@ -1187,21 +1363,28 @@ export class VaultRegistry {
     //     caller's explicit creation intent: turning on sync for a folder the
     //     user opened, or joining an empty team vault, must never invent
     //     content in it.
-    const serverNotes = await this.api.listNotes(vaultId);
-    if (this.stale()) return { seeded: false };
+    //
+    //     Ask the FREE questions first. Only a just-created vault can seed, and
+    //     only into an empty folder — both local facts. The server's note list
+    //     is not free: it is the same `GET /api/notes` that `syncStructure`
+    //     fetches below (`listNoteRegistry`), so on a 6k-note vault every
+    //     ordinary relaunch downloaded all 6k rows TWICE to answer one boolean.
     let workingTree = tree;
     let seeded = false;
     const localFlat = flattenTree(tree);
     if (
       input.seedIfEmpty === true &&
-      serverNotes.length === 0 &&
       localFlat.notes.length === 0 &&
       localFlat.folders.length === 0
     ) {
-      await seedWelcomeContent(this.epoch());
+      const serverNotes = await this.api.listNotes(vaultId);
       if (this.stale()) return { seeded: false };
-      workingTree = await this.readFullTree();
-      seeded = true;
+      if (serverNotes.length === 0) {
+        await seedWelcomeContent(this.epoch());
+        if (this.stale()) return { seeded: false };
+        workingTree = await this.readFullTree();
+        seeded = true;
+      }
     }
 
     await this.syncStructure(vaultId, workingTree, { inbound: true });
@@ -1291,11 +1474,19 @@ export class VaultRegistry {
     // guess.
     this.tuneCheckpointBatch(this.byPath.size);
 
-    // The local index's docId per note path, read BEFORE any decision so inbound
-    // can match by docId rather than by path (a rename changes the path, which is
-    // exactly why path-matching produced duplicates).
-    let titles = await ipc.listNoteTitles(this.epoch());
-    if (this.stale()) return false;
+    // The local index's docId per note path, for inbound to match by docId
+    // rather than by path (a rename changes the path, which is exactly why
+    // path-matching produced duplicates).
+    //
+    // A memoized THUNK, not a value: this read parks on the SQLite index write
+    // lock held by the background rebuild (#84), which made it the single worst
+    // blocking call on the launch path — and a steady-state relaunch needs it for
+    // nothing at all. Both consumers (the inbound fallback identity map and the
+    // create-missing-notes pass) ask for it only when they have an unmapped path
+    // to resolve. Memoized so the two of them share one read when they do.
+    let titlesCache: ipc.NoteTitle[] | null = null;
+    const titles = async (): Promise<ipc.NoteTitle[]> =>
+      (titlesCache ??= await ipc.listNoteTitles(this.epoch()));
 
     // 1. Inbound: apply the server's structural changes to disk. Runs first so the
     //    outbound steps below see a tree that already agrees about paths.
@@ -1321,8 +1512,8 @@ export class VaultRegistry {
         const reread = await this.readFullTree();
         if (this.stale()) return false;
         ({ folders, notes } = flattenTree(reread));
-        titles = await ipc.listNoteTitles(this.epoch());
-        if (this.stale()) return false;
+        // The paths moved under us, so any memoized read describes the old tree.
+        titlesCache = null;
         // Re-read the server's notes too: `move_note` bumps rows we may have just
         // raced, and a stale list here would undo the move we just applied.
         const fresh = await this.api.listNoteRegistry(vaultId);
@@ -1443,14 +1634,20 @@ export class VaultRegistry {
 
     this.sink.phase("registering", missingFolders.length + missingNotes.length);
 
-    const titleByPath = new Map(titles.map((t) => [t.path, t.title] as const));
+    // Titles + local doc_ids for the notes we are about to CREATE server-side —
+    // so the index read happens only when there is something to create (on a
+    // fully-registered vault, never). `this.sink.phase` above needs none of it.
+    //
     // The local index already keyed each note by a stable doc_id. Supply it as
     // the server id so a note has ONE identity across the .md file, the local
     // CRDT store, and the server (the invariant: key by doc_id, never by path).
     // Omitting it lets the server mint a *different* random id, which forks the
     // note — the editor's bridge persists CRDT under the local id while sync
     // reads/writes the server id, so content silently fails to appear.
-    const idByPath = new Map(titles.map((t) => [t.path, t.id] as const));
+    const titleRows = missingNotes.length > 0 ? await titles() : [];
+    if (this.stale()) return false;
+    const titleByPath = new Map(titleRows.map((t) => [t.path, t.title] as const));
+    const idByPath = new Map(titleRows.map((t) => [t.path, t.id] as const));
 
     // ---- folders, level by level ----
     const byDepth = new Map<number, TreeNode[]>();
@@ -1576,11 +1773,18 @@ export class VaultRegistry {
 
     // 5. Materialize server-only notes locally. This is what makes a folder
     //    that's empty on this device (a just-joined vault, or a fresh
-    //    per-vault folder) actually show the vault's notes. We write an
-    //    empty file — `writeNoteIfMissing` creates any missing parent folders —
-    //    and the real content hydrates lazily when the note is opened
+    //    per-vault folder) actually show the vault's notes. We create the file
+    //    empty — `writeNoteIfMissing` creates any missing parent folders — and
+    //    then, when THIS DEVICE already holds the note's CRDT, immediately write
+    //    its text (`InboundHost.materializeContent`). Otherwise it stays a 0-byte
+    //    placeholder and hydrates lazily when the note is opened
     //    (pull-before-seed in docSession, which never seeds a non-empty server
-    //    doc from an empty file).
+    //    doc from an empty file) or when the vault channel backfills it.
+    //
+    //    The hydrate is not cosmetic. A local delete of a synced note used to
+    //    reach this step, be re-created as 0 bytes, and then have that emptiness
+    //    diff-merged into the note's still-populated CRDT and pushed — the
+    //    server's copy destroyed by a file the app had just written (#93).
     //
     //    CREATE-ONLY, never overwrite. `toMaterialize` is a *difference of two
     //    lists*, and the local side of that difference is only as complete as the
@@ -1606,8 +1810,31 @@ export class VaultRegistry {
         // slips past (this loop used to litter vault A's note paths through
         // vault B's folder).
         try {
-          await ipc.writeNoteIfMissing(rp, "", this.epoch());
-          mutated = true;
+          // Create-only FIRST and unconditionally — that guard is what makes a
+          // wrong "server-only" verdict cost nothing (see above), and its boolean
+          // says whether THIS pass created the file, so an existing real note is
+          // never touched by the hydrate below.
+          const created = await ipc.writeNoteIfMissing(rp, "", this.epoch());
+          // A path that already held a file is not a change: claiming one made a
+          // pull with nothing to do report "changed" (and re-read the registry,
+          // and refresh the UI) on every pass it ran.
+          if (created) {
+            mutated = true;
+            // Remember it for one watcher echo, so the sync layer does not treat
+            // our own placeholder as an external edit worth pushing.
+            this.markMaterialized(rp);
+            const docId = this.byPath.get(rp)?.docId ?? null;
+            // Fill it in from local CRDT when this device has it. Best effort: a
+            // failure leaves today's 0-byte placeholder, which is exactly the
+            // current behaviour, so this can never make things worse.
+            if (docId && this.host) {
+              try {
+                await this.host.materializeContent(docId, rp);
+              } catch (e) {
+                console.warn(`[registry] hydrating ${rp} from local CRDT failed`, e);
+              }
+            }
+          }
           this.sink.item("ok");
         } catch (e) {
           if (ipc.isVaultMismatch(e)) return; // the vault moved on — not a failure
@@ -1638,6 +1865,7 @@ export class VaultRegistry {
     // can't happen after a relaunch.
     checkpoint.touch();
     await checkpoint.flush();
+    perf.mark("reconcile-done");
     return mutated;
   }
 

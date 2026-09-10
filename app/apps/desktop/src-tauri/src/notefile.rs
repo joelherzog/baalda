@@ -150,15 +150,24 @@ pub fn rename_path(vault: &Path, old_rel: &str, new_rel: &str) -> AppResult<Stri
 /// registry change and must be a no-op the second time. Sniffing
 /// `create_folder`'s error string across the IPC boundary to tell "already there"
 /// from a real failure is how idempotency quietly breaks.
-pub fn ensure_folder(vault: &Path, rel: &str) -> AppResult<()> {
+///
+/// Returns true when THIS call created the directory, false when it already
+/// existed. The caller (an inbound registry pull) uses that to tell a real disk
+/// change — one the watcher is about to echo — from a no-op: counting every
+/// `ensure_folder` as a change made a pull that changed nothing report "disk
+/// changed", re-read the registry, and refresh the whole UI on every pass.
+pub fn ensure_folder(vault: &Path, rel: &str) -> AppResult<bool> {
     if crate::vault::rel_path_is_ignored(rel) {
         return Err(AppError::new(
             "refusing to create a folder in an ignored dir",
         ));
     }
     let abs = resolve_in_vault(vault, rel)?;
+    if abs.is_dir() {
+        return Ok(false);
+    }
     std::fs::create_dir_all(&abs)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Move a note OUT of the note pipeline into `.context/trash/<stamp>/<rel>`
@@ -174,15 +183,7 @@ pub fn ensure_folder(vault: &Path, rel: &str) -> AppResult<()> {
 /// `stamp` comes from the caller: there's no date crate in this binary, and one
 /// stamp per reconciliation pass keeps a multi-note delete together in one folder.
 pub fn trash_note(vault: &Path, rel: &str, stamp: &str) -> AppResult<String> {
-    // The stamp is joined into a path, so it must be exactly one ordinary segment.
-    if stamp.is_empty()
-        || stamp.starts_with('.')
-        || !stamp
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-    {
-        return Err(AppError::new("invalid trash stamp"));
-    }
+    validate_trash_stamp(stamp)?;
     if crate::vault::rel_path_is_ignored(rel) {
         return Err(AppError::new(
             "refusing to trash a path inside an ignored dir",
@@ -208,6 +209,50 @@ pub fn trash_note(vault: &Path, rel: &str, stamp: &str) -> AppResult<String> {
     // which is the safe outcome.
     std::fs::rename(&abs, &dest)?;
     Ok(dest_rel)
+}
+
+/// Write `content` into `.context/trash/<stamp>/<rel>` — the recovery copy for a
+/// note whose FILE IS ALREADY GONE.
+///
+/// [`trash_note`] cannot serve this case: it renames the source file, and refuses
+/// outright when the source does not exist. A disk-observed delete (someone
+/// removed the `.md` in Finder, a script, `git checkout`) is propagated to the
+/// server as a real delete, and the only surviving copy of the text at that
+/// moment is the doc the caller holds in memory — so it is written here first,
+/// under the same `.context/trash/<stamp>/` layout an inbound delete uses, and
+/// with the same suffixing when a name inside the stamp is taken.
+///
+/// Returns the trash-relative destination that was written.
+pub fn write_trash_copy(vault: &Path, rel: &str, stamp: &str, content: &str) -> AppResult<String> {
+    validate_trash_stamp(stamp)?;
+    if crate::vault::rel_path_is_ignored(rel) {
+        return Err(AppError::new(
+            "refusing to trash a path inside an ignored dir",
+        ));
+    }
+    let dest_rel = unique_trash_dest(vault, &format!(".context/trash/{stamp}/{rel}"))?;
+    let dest = resolve_in_vault(vault, &dest_rel)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Not `write_note`: that resolves a vault-relative path and re-indexes, and
+    // nothing inside `.context/` may enter the note pipeline. fsync'd, because
+    // this IS the only copy at the instant it is written.
+    write_atomic_fsync(&dest, content.as_bytes())?;
+    Ok(dest_rel)
+}
+
+/// The stamp is joined into a path, so it must be exactly one ordinary segment.
+fn validate_trash_stamp(stamp: &str) -> AppResult<()> {
+    if stamp.is_empty()
+        || stamp.starts_with('.')
+        || !stamp
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(AppError::new("invalid trash stamp"));
+    }
+    Ok(())
 }
 
 /// `x.md` → `x (2).md` when the destination inside this stamp is already taken.
@@ -243,15 +288,35 @@ pub fn delete_folder_if_empty(vault: &Path, rel: &str) -> AppResult<bool> {
     }
     let abs = resolve_in_vault(vault, rel)?;
     if !abs.exists() {
-        return Ok(true); // already gone — the goal state
+        // Already gone — the goal state, but NOT something this call did: the
+        // caller counts `true` as a disk change the watcher will echo.
+        return Ok(false);
     }
     if !abs.is_dir() {
         return Ok(false); // a file lives at this path; not ours to remove
+    }
+    // Finder drops a `.DS_Store` into any folder it has shown, and Explorer
+    // does the same with `desktop.ini`/`Thumbs.db`. None of those is vault
+    // content — the walker never surfaces them — yet `remove_dir` refuses a
+    // directory holding one, which is exactly how a folder whose notes had all
+    // left kept sitting in the sidebar. Sweep ONLY those names, so a folder that
+    // holds anything else still stays put.
+    if let Ok(entries) = std::fs::read_dir(&abs) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if OS_METADATA_FILES.iter().any(|m| name == *m) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
     // Any failure (non-empty, permissions, races) means "leave it": a folder
     // that lingers is cosmetic, a reconcile pass that fails over it is not.
     Ok(std::fs::remove_dir(&abs).is_ok())
 }
+
+/// Per-folder metadata the OS's file browser writes on its own. Never vault
+/// content, so an otherwise-empty folder holding only these counts as empty.
+const OS_METADATA_FILES: &[&str] = &[".DS_Store", "desktop.ini", "Thumbs.db"];
 
 /// Delete a file or folder (recursively for folders).
 pub fn delete_path(vault: &Path, rel: &str) -> AppResult<()> {
@@ -492,14 +557,78 @@ mod tests {
         assert!(trash_note(tmp.path(), "nope.md", "s1").is_err());
     }
 
+    // ---- write_trash_copy -------------------------------------------------
+    //
+    // The recovery copy for a note whose file is ALREADY gone (someone deleted
+    // the `.md` outside the app). `trash_note` refuses that case by design — it
+    // renames a source file — so this is the only way those bytes survive the
+    // delete we are about to propagate to the server.
+
+    #[test]
+    fn write_trash_copy_saves_content_for_a_file_that_is_already_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No source file anywhere: `trash_note` cannot help here.
+        assert!(trash_note(tmp.path(), "Notes/bye.md", "s1").is_err());
+
+        let dest = write_trash_copy(tmp.path(), "Notes/bye.md", "s1", "# Bye\n\ntext").unwrap();
+        assert_eq!(dest, ".context/trash/s1/Notes/bye.md");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".context/trash/s1/Notes/bye.md")).unwrap(),
+            "# Bye\n\ntext"
+        );
+        // Nothing appeared back at the note's own path — a recovery copy must
+        // never resurrect the file the user deleted.
+        assert!(!tmp.path().join("Notes/bye.md").exists());
+    }
+
+    #[test]
+    fn write_trash_copy_disambiguates_within_one_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            write_trash_copy(tmp.path(), "a.md", "s1", "first").unwrap(),
+            ".context/trash/s1/a.md"
+        );
+        assert_eq!(
+            write_trash_copy(tmp.path(), "a.md", "s1", "second").unwrap(),
+            ".context/trash/s1/a (2).md"
+        );
+        // The first copy is intact: a second delete of the same path in one
+        // window must not overwrite the bytes of the first.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".context/trash/s1/a.md")).unwrap(),
+            "first"
+        );
+    }
+
+    #[test]
+    fn write_trash_copy_rejects_a_bad_stamp_and_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in ["", ".", "..", "a/b", "with space", ".hidden"] {
+            assert!(
+                write_trash_copy(tmp.path(), "a.md", bad, "x").is_err(),
+                "stamp {bad:?} should be rejected"
+            );
+        }
+        assert!(write_trash_copy(tmp.path(), "../escape.md", "s1", "x").is_err());
+        // A path already inside `.context` would nest the app's own state dir
+        // inside the trash.
+        assert!(write_trash_copy(tmp.path(), ".context/config.json", "s1", "x").is_err());
+    }
+
     #[test]
     fn ensure_folder_is_idempotent_and_makes_parents() {
         let tmp = tempfile::tempdir().unwrap();
-        ensure_folder(tmp.path(), "A/B/C").unwrap();
+        assert!(ensure_folder(tmp.path(), "A/B/C").unwrap());
         assert!(tmp.path().join("A/B/C").is_dir());
         // Unlike `create_folder`, a second call is a no-op rather than an error —
-        // reconciliation runs on every registry change.
-        ensure_folder(tmp.path(), "A/B/C").unwrap();
+        // reconciliation runs on every registry change — and says so.
+        assert!(!ensure_folder(tmp.path(), "A/B/C").unwrap());
+        // On a case-insensitive filesystem a spelling variant IS the same dir, so
+        // it too is a no-op — the report must not claim a change that never
+        // happened (that claim is what kept a registry pull loop alive, #98).
+        if tmp.path().join("a/b/c").is_dir() {
+            assert!(!ensure_folder(tmp.path(), "a/b/c").unwrap());
+        }
     }
 
     #[test]
@@ -523,8 +652,8 @@ mod tests {
         assert!(delete_folder_if_empty(tmp.path(), "A/B").unwrap());
         assert!(delete_folder_if_empty(tmp.path(), "A").unwrap());
         assert!(!tmp.path().join("A").exists());
-        // Already gone is the goal state, not an error.
-        assert!(delete_folder_if_empty(tmp.path(), "A").unwrap());
+        // Already gone is the goal state, not an error — but nothing was removed.
+        assert!(!delete_folder_if_empty(tmp.path(), "A").unwrap());
         // A FILE at the path is not ours to remove.
         std::fs::write(tmp.path().join("f.md"), "x").unwrap();
         assert!(!delete_folder_if_empty(tmp.path(), "f.md").unwrap());
@@ -532,5 +661,22 @@ mod tests {
         // Ignored dirs and traversal are refused loudly.
         assert!(delete_folder_if_empty(tmp.path(), ".context/trash").is_err());
         assert!(delete_folder_if_empty(tmp.path(), "../up").is_err());
+    }
+
+    #[test]
+    fn delete_folder_if_empty_treats_os_metadata_as_empty() {
+        // Finder had shown the folder, so `.DS_Store` is in it. That is not
+        // content: the folder is still removed. Any OTHER dotfile still blocks.
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_folder(tmp.path(), "Getting Started").unwrap();
+        std::fs::write(tmp.path().join("Getting Started/.DS_Store"), b"\0").unwrap();
+        assert!(delete_folder_if_empty(tmp.path(), "Getting Started").unwrap());
+        assert!(!tmp.path().join("Getting Started").exists());
+
+        ensure_folder(tmp.path(), "Other").unwrap();
+        std::fs::write(tmp.path().join("Other/.DS_Store"), b"\0").unwrap();
+        std::fs::write(tmp.path().join("Other/.hidden-note"), "mine").unwrap();
+        assert!(!delete_folder_if_empty(tmp.path(), "Other").unwrap());
+        assert!(tmp.path().join("Other/.hidden-note").exists());
     }
 }

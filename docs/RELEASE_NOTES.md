@@ -1,6 +1,5 @@
-- Folder badges now count only the notes that actually need syncing (for example "1/2" for two new files), instead of the folder's whole population ("186/187")
-- A fully synced vault shows its synced dots right after connecting, without waiting for a sync run
-- Editing while a sync is running no longer re-reads every note title on each change, so the sidebar stays responsive on large vaults
-- A file added to a folder that a teammate had moved on the server no longer fails to sync forever ("1 not synced"): the folder is re-created at its old path and the file registers normally
-- Empty leftover files of notes deleted on the server are now cleaned up instead of lingering as unsyncable stubs
-- After a teammate moves a folder, the emptied old folder is removed on your device instead of coming back for everyone as an empty duplicate
+- Baalda now opens straight into your vault: the sidebar appears right away and signing in, syncing and indexing carry on in the background. Notes you click in those first moments still open safely
+- You can now leave a vault you don't own: Vault Settings → Vaults → Leave. The vault is removed from your devices, the owner is notified by email, and you get a receipt
+- Moving a Pro subscription to another vault now opens a clear dialog that shows each eligible vault with its members and explains what changes, instead of a bare dropdown
+- Large notes open faster and launching does less work up front: note history now moves between the app and its storage as raw data instead of text, and reopening a vault no longer rewrites index rows that did not change
+- Faster launch: the window now opens with the app already drawn instead of a blank frame, and Baalda loads about half as much code up front (and installs smaller)

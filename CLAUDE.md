@@ -23,6 +23,13 @@ Three pieces; this open-source repo holds the first two.
   because the updater checks our minisign signature, not an OS certificate.
   There is no draft/review gate — pushing a `v*` tag ships to every running app on its next
   updater poll (Tauri updater polls `releases/latest`).
+  Because of that, review happens *before* main: PRs target the long-lived **`staging`** branch,
+  and every push to it runs `.github/workflows/staging-release.yml`, which publishes a separate
+  auto-updating **"Baalda Staging"** app (`com.baalda.context.staging`, version
+  `<base>-staging.<run#>`, server from the `STAGING_SERVER_URL` Actions variable) into one rolling
+  GitHub *prerelease* tagged `staging` — invisible to production's updater, which resolves
+  `releases/latest` and so skips prereleases. Promotion is a fast-forward `staging` → `main` plus
+  the four-file version bump; see `docs/RELEASE.md` → Staging.
 - **Backend server** (`app/apps/server`) — open source and self-hostable (Node + Postgres).
   The managed option runs this **same server code**, publicly reachable at
   `https://api.baalda.com`; users choose an instance via the server URL in Settings. There is
@@ -107,11 +114,14 @@ Errors: single `AppError(String)` (`error.rs`).
   FTS5 `notes_fts`, `tags`/`note_tags`, `links`, `folders`, `yjs_updates`, `yjs_snapshot`. Notes keyed by
   `doc_id`; `rebuild` preserves ids and never wipes the CRDT tables; `rename_note` rewrites paths by id so
   backlinks survive moves.
-- `watcher.rs` — `notify` recursive watcher, 150ms-debounced, emits `file-changed {path, kind}`.
+- `watcher.rs` — `notify` recursive watcher, 150ms-debounced (1000ms ceiling), emits ONE batched
+  `files-changed {changes: [{path, kind}]}` per drain. `kind` is `modified` | `removed` | `tree`, derived
+  from an existence check rather than forwarded from `notify` (whose event kinds and rename pairing we
+  deliberately ignore); a rename therefore arrives as an unpaired `removed` + `modified` in one batch.
 - `attachments.rs` — path-validated binary I/O under `attachments/`; never enters the note/CRDT pipeline.
 - `keychain.rs` — `keyring` crate, service `com.baalda.context`; trait-based so tests use a fake.
 
-Tauri events to the UI: **`vault-opened`** and **`file-changed`** (the only two).
+Tauri events to the UI: **`vault-opened`** and **`files-changed`** (the only two).
 
 ### Desktop — the bridge (`src/lib/bridge/`)
 Pure TS with dependency-injected I/O so it runs under vitest in Node. `adapter.ts` wires production I/O.
@@ -140,21 +150,49 @@ Pure TS with dependency-injected I/O so it runs under vitest in Node. `adapter.t
 - `startup.ts` (`decideSeed`) — **split-brain rule**: when signed in, pull from server FIRST, then seed a
   local orphan only if the doc is still empty. Reversing this causes permanent divergence.
 - `registry.ts` — reconciles local vault ↔ server vault/folders/notes, persists the doc-id map to
-  `.context/config.json`, materializes server-only notes as empty files (hydrate lazily).
+  `.context/config.json`, materializes server-only notes create-only (`write_note_if_missing`) and then
+  fills them in from THIS device's local CRDT when it has one (`InboundHost.materializeContent` →
+  `NoteBridge.writeThrough`); with no local CRDT the file stays 0 bytes and hydrates lazily on open or
+  from the vault channel's backfill. Each path it creates is remembered for exactly one watcher echo
+  (`consumeMaterialized`), so the app's own placeholder is never mistaken for an external edit.
 - `tokenRefresh.ts` — re-mint 60s before JWT expiry. `attachments.ts` — content-hash (sha256) diff, upload/download.
 - **External writers are first-class** (`handleLocalFileChanged` in `docSession.ts`): a watcher event for a
   non-open note routes to the sync layer — unmapped/structural changes trigger the debounced registry pull
   (register + upload), mapped notes get a debounced `ContentUploader` run with `force` + `ingestFromFile`
   (diff-merge the file into the CRDT via `NoteBridge.ingestNow`, echo-guarded fast-path skips our own egest
   echoes; the `divergedDocs` set forces a connect for out-of-band merges by resident bridges / cold applies).
-  `NoteBridge.hydrate` also ingests the file on reopen when it moved on while the doc was closed. Disk
-  deletions are deliberately NOT propagated to the server.
+  `NoteBridge.hydrate` also ingests the file on reopen when it moved on while the doc was closed.
+- **Disk deletes ARE propagated** (`SyncManager.drainDiskDeletes`, #93), after a `DISK_DELETE_GRACE_MS`
+  (2.5 s) window that filters everything which merely looks like a delete: a `modified` for the same path
+  cancels it (an editor's unlink-and-rewrite save, a rename-back), the file is re-checked on disk
+  (`ipc.noteExists`), and a pending delete whose doc text hashes equal to an unmapped file that appeared in
+  the same window is a RENAME — `registry.renamePath` + `ipc.rebindNoteId` keep the `doc_id` (a batch that
+  queued a delete also defers its registry pull, or the new path would register as a second note first).
+  Survivors write the doc's text to `.context/trash/<stamp>/` (`ipc.writeTrashCopy`) and then call
+  `registry.deletePath` — the SAME soft delete the sidebar's Delete makes, never `ipc.deletePath` (the file
+  is already gone). Three refusals: a doc that is not `isPushed` (its only copy may be local), a session
+  that is not yet live (`liveSince` = vault channel `synced` + one completed pull, so a missing file at
+  startup re-materializes instead), and more than `max(5, ceil(mapped * 0.2))` deletes in one window —
+  which abandons the whole batch and reports it, because an unmounted volume looks exactly like a bulk
+  delete. The ingest side is guarded too: a 0-byte file never clears a populated doc
+  (`allowTruncateFromDisk`, default false).
 - **`ready.empty` is filtered against disk** (`SyncManager.settleServerEmpty`): the server names every
   readable doc it holds no CRDT for on each connect, but a doc whose LOCAL file is empty too has nothing
   to push — it is marked pushed + badged synced and never queued (a vault with 307 zero-byte `_Index.md`
   stubs used to "re-sync 307 notes" on every reload). Files over `MAX_NOTE_BYTES` (10 MB, the server's
   `MAX_NOTE_MB`) fail once, permanently, without a socket (`permanentFailures`) instead of being rejected
   by the server on every reconnect.
+- **`ready.behind` is the other authority** (`SyncManager.handleServerBehind`, #98): the server's backfill
+  diff (`loadDocDiff`) treats a client whose state vector *covers* the server's as up to date — unequal is
+  not behind — and flags `clientAhead` when the client holds ops the server never received; those docs are
+  named on `ready.behind` and queued for a push exactly like `ready.empty` ones. Before this, 40 notes with
+  unflushed local edits re-downloaded a 2-byte empty diff on every connect ("Syncing 40/40" on each
+  reload) and the edits never left the device.
+- **Paths compare case-insensitively everywhere** — notes (`samePath`) AND folders in `planInbound`, like
+  the server's `lower(path)` unique indexes and the outbound `registry.ts` adoption. A vault whose disk
+  said `Projects/community` while the server said `Projects/Community` (with empty server folders under
+  it) used to create and remove the same directories on alternate pulls, each pass re-triggering the next
+  through the watcher's `tree` event: one idle client pulled the full registry every ~1.5 s (#98).
 
 ### Desktop — React (`src/`)
 `store.ts` is a Zustand **UI view-state mirror only** (vault, tree, open note, auth/session, org members,
@@ -167,17 +205,27 @@ script/style/iframe, strip `on*`/`javascript:`).
 Two listeners, one Node process (`index.ts`): Hocuspocus WS (:3011) + Hono HTTP (:3010). The same
 Hocuspocus instance is also served on the HTTP port at `/sync` (`sync/http-upgrade.ts`) so the whole
 server runs behind a single port/domain — that's what production deploys use (Dockerfile +
-`railway.json` + `docs/DEPLOY.md`; migrations run pre-deploy via `node dist/db/migrate.js`). MCP writes
+Railway IaC in `app/.railway/railway.ts`, applied with `railway config apply` from `app/` — the repo-root
+`railway.json` is the legacy copy new Railway services ignore — + `docs/DEPLOY.md`; migrations run
+pre-deploy via `node dist/db/migrate.js`). MCP writes
 flow through the same sync server via `createDocWriter` so AI edits persist/broadcast like human edits.
 - `auth/auth.ts` — Better Auth; **argon2id** (overrides default scrypt) via `@node-rs/argon2`; `bearer` +
   `organization` plugins (org = **vault**, the user-facing unified entity — Local / Synced / Remote states;
   roles owner/admin/member; 48h invitations). Session token is
   opaque (instant revocation), stored client-side only in the OS keychain.
 - `http/routes/` — `registry` (vaults/folders/notes/files), `shares` (folder/file ACL), `orgs` (join codes),
-  `graph` (nodes/edges + semantic search), `sync-token`, `blobs` (attachment store), `mcp`,
+  `graph` (nodes/edges + semantic search), `sync-token`, `blobs` (attachment store), `mcp`, `billing`,
   `public-links` (`/api/notes/:docId/public-link` mint/inspect/revoke + public `GET /p/:token`
   read-only page — token is the capability; renders via the escape-first `render/note-html.ts`,
   no renderer deps).
+- `billing/` — Polar behind `provider.ts`; `store.ts` is the ONLY writer of a `subscriptions` row and
+  always persists the provider's returned state. One vault = one subscription (409 `already_subscribed`).
+  Deleting a vault cancels **at period end first** and aborts the delete if the provider refuses (502
+  `subscription_cancel_failed`; Better Auth's own org-delete is off via `disableOrganizationDeletion`).
+  The row then outlives the org as a **tombstone** — migration 024 dropped the cascade and added
+  `deleted_at`/`org_name`/`owner_user_id` — so a late webhook is stored, not FK-failed and retried
+  forever. Webhooks resolve by `provider_subscription_id` first, then metadata, which is what lets
+  `POST /api/billing/orgs/:orgId/transfer` (owner; un-cancels at Polar) move one; `/mine` reconciles.
 - `sync/hocuspocus.ts` — `onAuthenticate` verifies the per-doc JWT & sets `readOnly` for view grants;
   `onChange` appends the binary update + schedules re-index. `disconnectDoc` force-closes sockets on revoke.
 - `yjs/persistence.ts` — binary-only store: `doc_updates` append log + `doc_snapshots` (compact past
@@ -221,7 +269,9 @@ token per note; revoke = DELETE).
 ## Server env vars (`app/apps/server/.env`)
 `DATABASE_URL` (Docker host port **5439**→5432) · `JWT_SECRET` (Better Auth crypto **and** sync JWTs —
 change in prod) · `BETTER_AUTH_URL` · `PORT` (3010) · `HOCUSPOCUS_PORT` (3011) · `SYNC_TOKEN_TTL_SECONDS`
-(600) · `COMPACTION_THRESHOLD` (50) · `CORS_ORIGINS` (optional) · `OPENAI_API_KEY` (optional).
+(600) · `COMPACTION_THRESHOLD` (50) · `CORS_ORIGINS` (optional) · `OPENAI_API_KEY` (optional) ·
+`EMAIL_FROM` + `SMTP_URL` | `RESEND_API_KEY` (optional; turns on password reset, sign-up verification
+and invitation emails — `src/email/mailer.ts`; unset ⇒ none offered, like Google OAuth).
 
 ## Conventions & gotchas
 

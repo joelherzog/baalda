@@ -66,8 +66,20 @@ export interface BridgeConfig {
   ingestDebounceMs: number;
   /** Debounce before a CRDT→file egest write. */
   egestDebounceMs: number;
-  /** Compact the update log when it exceeds this many rows after load. */
+  /** Compact the update log when it exceeds this many rows. */
   compactThreshold: number;
+  /**
+   * Compact the update log when it exceeds this many BYTES, whatever the row
+   * count.
+   *
+   * The row count alone never fires on a real vault: the trigger was 64 rows and
+   * the busiest doc on a 5,933-note vault held 58 — while 28 individual updates
+   * were over 1 MB each (a paste, an AI rewrite, an image data-URI). So the log
+   * a launch has to read back, and every doc load has to apply, grew without
+   * bound under a threshold that was never reached. Bytes are what cost time
+   * here, so bytes are what we count. 0 disables the check.
+   */
+  compactBytes: number;
   /** Take a recovery snapshot before a diff that churns this fraction of the doc. */
   largeDiffRatio: number;
   /**
@@ -82,6 +94,21 @@ export interface BridgeConfig {
    * note we also refuse to read back in. 0 disables the check.
    */
   maxIngestBytes: number;
+  /**
+   * Allow a 0-byte file to clear a doc that still holds text (default false).
+   *
+   * The ingest-side twin of the egest clobber guard. A file that reads as
+   * COMPLETELY empty against a populated doc is almost never an edit: it is the
+   * registry's own 0-byte placeholder landing on a note whose content this
+   * device already has (issue #93 — the placeholder was diff-merged as a
+   * delete-all and pushed, destroying the server's copy), or a truncated write
+   * caught mid-flight. Refusing costs a log line and a re-read; accepting costs
+   * the note, on every device.
+   *
+   * A PARTIAL truncation still applies — this is only the all-or-nothing case.
+   * Set true where clearing a note from disk must be honoured verbatim.
+   */
+  allowTruncateFromDisk: boolean;
   /** First retry delay after a failed egest write; doubles per consecutive
    *  failure up to `egestRetryMaxMs`. */
   egestRetryBaseMs: number;
@@ -106,8 +133,12 @@ export const DEFAULT_CONFIG: BridgeConfig = {
   ingestDebounceMs: 150,
   egestDebounceMs: 300,
   compactThreshold: 64,
+  // 1 MB of pending updates is already more than a snapshot of almost any note
+  // would cost, so past this the log is pure overhead on every load.
+  compactBytes: 1024 * 1024,
   largeDiffRatio: 0.6,
   maxIngestBytes: 10 * 1024 * 1024,
+  allowTruncateFromDisk: false,
   egestRetryBaseMs: 1_000,
   egestRetryMaxMs: 30_000,
   // 500ms matches Yjs' own default and CodeMirror's `newGroupDelay`, so undo
