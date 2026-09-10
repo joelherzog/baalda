@@ -136,6 +136,7 @@ n/a = synchronous or sub-100ms by construction.
 | --- | --- | --- | --- |
 | Note open (bridge + first sync) | SQLite hydrate + provider sync | 0.05–3s | ✅ skeleton in the prose column, delayed 180ms |
 | Typing / autosave | debounced egest | n/a | ✅ existing "Auto-saved" |
+| Formatting toolbar button | one CM transaction | instant | ✅ button lights while the marker applies |
 | Push-to-talk | mic + relay | instant | ✅ existing talk states |
 | Search | local FTS5 | fast | n/a |
 | Graph view | in-memory sim | fast | n/a |

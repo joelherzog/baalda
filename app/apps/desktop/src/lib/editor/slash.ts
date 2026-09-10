@@ -32,7 +32,7 @@ function applyBlock(
   };
 }
 
-interface Block {
+export interface Block {
   label: string;
   detail: string;
   keywords: string;
@@ -41,7 +41,7 @@ interface Block {
   selTo?: number;
 }
 
-const BLOCKS: Block[] = [
+export const BLOCKS: Block[] = [
   { label: "Heading 1", detail: "#", keywords: "h1 title", insert: "# ", caret: 2 },
   { label: "Heading 2", detail: "##", keywords: "h2", insert: "## ", caret: 3 },
   { label: "Heading 3", detail: "###", keywords: "h3", insert: "### ", caret: 4 },
@@ -66,6 +66,27 @@ const BLOCKS: Block[] = [
   },
   { label: "Divider", detail: "---", keywords: "hr rule separator", insert: "---\n", caret: 4 },
 ];
+
+/** Look a block template up by its menu label (the toolbar's entry point). */
+export function findBlock(label: string): Block {
+  const block = BLOCKS.find((b) => b.label === label);
+  if (!block) throw new Error(`unknown block template: ${label}`);
+  return block;
+}
+
+/**
+ * Insert a block template at the caret, replacing the current selection. Same
+ * transaction shape as the slash menu's `applyBlock`, so a toolbar button and
+ * `/Table` produce byte-identical markdown.
+ */
+export function insertBlock(view: EditorView, block: Block): boolean {
+  if (view.state.readOnly) return false;
+  const { from, to } = view.state.selection.main;
+  applyBlock(block.insert, block.caret, block.selTo)(view, EMPTY_COMPLETION, from, to);
+  return true;
+}
+
+const EMPTY_COMPLETION: Completion = { label: "" };
 
 const COMPLETIONS: Completion[] = BLOCKS.map((b) => ({
   label: `/${b.label}`,
